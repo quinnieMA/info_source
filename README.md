@@ -7,7 +7,7 @@ D:\MA\
 ├── run_all.py
 │
 ├── scripts\
-│   ├── 01_clean_deal_modules.py
+│   ├── 01a_clean_deal_modules.py
 │   ├── 01b_clean_deal_overview.py
 │   ├── 01c_clean_deal_comments.py
 │   ├── 02_merge_deal_master.py
