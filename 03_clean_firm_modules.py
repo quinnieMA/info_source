@@ -1,40 +1,79 @@
 """
 03_clean_firm_modules.py
 ========================
-Clean three MA_firm sub-folders and save to data/cleaned/.
+Clean SIX MA_firm sub-modules and save to data/cleaned/.
 
 Sources:
-  Module F  — Pre-deal snapshot : raw/MA_firm/financial/acquisition_financial_1-4
-  Module Fb — Post-deal snapshot: raw/MA_firm/financial/acquisition_financial_1-4
-  Module G  — Company time-series: raw/MA_firm/financial/acquisition_company_financial_1-7
-             (file _8 is an exact duplicate of _7 — skipped)
-  Module H  — Legal status      : raw/MA_firm/legal/acquisition_legal_1-2
-  ============extract incorporated year on 2026-07-27==========================
+  Module F  — Pre-deal snapshot  : raw/MA_firm/financial/acquisition_financial_*_cleaned.csv
+  Module Fb — Post-deal snapshot : same raw files as Module F (re-read; see note below)
+  Module G  — Company time-series: raw/MA_firm/financial/acquisition_company_financial_*_cleaned.csv
+              (file _8 is an exact duplicate of _7 — excluded by filename filter)
+  Module H  — Legal status       : raw/MA_firm/legal/acquisition_legal_*_cleaned.csv
+  Module I  — Listed-firm status : raw/MA_firm/listedstatus/list_*.csv
+  Module J  — Advisor counts     : raw/MA_firm/advisor/advisor*_cleaned.csv
 
-Processing principle (all modules):
+  extract incorporated year added 2026-07-27
+
+Processing principle (Modules F, Fb, G, H — via dedup_by_deal()):
   - Read each batch CSV in file order — NO sort before ffill
   - ffill deal_num within each batch BEFORE stacking
   - Replace n.a., n.s., -, NA with NaN
   - Strip whitespace from string columns
-  - Deduplicate on deal_num keeping the first row
-    (first Zephyr row per deal = target entity with target financials)
-  - Numeric financial columns coerced to float
+  - Deduplicate via a 7-step pipeline (see the dedup_by_deal() docstring):
+      count entities → drop ven_* → DROP MULTI-TARGET DEALS →
+      ffill all columns → drop rows with incomplete acq identity triple →
+      dedup on [deal_num, tar_bvd_id_num, acq_bvd_id_num] → merge stats back
+  - Numeric financial columns coerced to float; entity ID columns are
+    whitelisted and never coerced (they may contain letters/hyphens)
 
-No ratio or derived variable construction here.
-All ratio variables (EBITDA Margin, Leverage, ROA, Revenue Growth)
-are computed in Stata at the analysis stage.
+  FINAL GRAIN for F/Fb/G/H: one row per
+      (deal_num, tar_bvd_id_num, acq_bvd_id_num)
+  NOT one row per deal_num — a deal with N acquirers yields N rows.
 
-Outputs:
-  data/cleaned/03_firm_financial_predeal.csv
-  data/cleaned/03b_firm_financial_postdeal.csv added on 2026-08-03=============
-  data/cleaned/03_firm_financial_company.csv
-  data/cleaned/03_firm_legal.csv
-  data/cleaned/03b_listed_status.csv
+  Module I is the exception: it dedups on deal_num alone (keep first),
+  because the listed-status file carries one target + one acquirer per deal.
+  Module J aggregates advisor detail rows to one row per deal_num.
 
+⚠️ MULTI-TARGET DEALS ARE DROPPED HERE (Step 3 of dedup_by_deal):
+  Any deal with ≥2 distinct targets is discarded entirely, because the
+  target↔acquirer pairing is ambiguous.
+  This is ASYMMETRIC with Module 01b (01b_deal_overview.py), which RETAINS
+  multi-target deals and therefore has 58,963 rows vs 55,586 unique
+  deal_nums. Downstream merges in 04a collapse to one row per deal_num;
+  if you ever change this step, re-verify that 04a still produces unique
+  deal_nums.
 
+No financial RATIO variables are constructed here.
+All ratio variables (EBITDA margin, leverage, ROA, revenue growth) are
+computed downstream (Stata / 04a-08b pipeline).
+Exception: tar_incorp_d_year / acq_incorp_d_year ARE derived here by parsing
+tar_incorp_d / acq_incorp_d (added 2026-07-27).
+
+Outputs (data/cleaned/):
+  03_firm_financial_predeal.csv      Module F
+  03b_firm_financial_postdeal.csv    Module Fb   (added 2026-08-03)
+  03_firm_financial_company.csv      Module G
+  03_firm_legal.csv                  Module H
+  03b_listed_status.csv              Module I
+  03b_firm_advisor_count.csv         Module J
+
+Coverage diagnostics (data/cleaned/), one per module except I:
+  _cov_moduleF_predeal.csv, _cov_moduleFb_postdeal.csv,
+  _cov_moduleG_company.csv, _cov_moduleH_legal.csv,
+  _cov_moduleJ_advisor.csv
+  Each lists every column with non-null count, numeric-parseable count and
+  coverage %, plus a tar-vs-acq comparison that flags columns present for
+  the target but entirely empty for the acquirer.
+
+Console log: all print() output is tee'd to
+  data/merged/03_clean_firm_modules_log.txt   (overwritten each run)
 
 Author: Zhaohua Li  Date: 2026-04-12
 adjusted: Qing  Date: 2026-08-03
+Revised 2026-09-06: docstring corrected — six modules (was "three"), dedup
+  grain is (deal_num, tar, acq) not deal_num, multi-target deals are dropped
+  (asymmetric with 01b), Module I/J sources and outputs added, inc-year
+  derivation and log redirection documented.
 """
 
 import os
@@ -43,11 +82,58 @@ import pandas as pd
 import numpy as np
 
 # ── Paths ──────────────────────────────────────────────────────────────────
-BASE      = r"D:\FlashCenter\LQ"
+BASE      = r"D:\MA"
 RAW_FIRM  = os.path.join(BASE, "raw", "MA_firm")
 CLEANED   = os.path.join(BASE, "data", "cleaned")
 
 os.makedirs(CLEANED, exist_ok=True)
+
+# ════════════════════════════════════════════════════════════════════════════
+# 日志重定向：所有 print 同时写入控制台 + 文件（2026-09-06 新增）
+# 无需改动任何 print；与 02/04a/08b 的诊断日志同目录
+# ════════════════════════════════════════════════════════════════════════════
+import sys, atexit
+from datetime import datetime
+
+class _Tee(object):
+    """把输出同时写到多个流（控制台 + 日志文件）"""
+    def __init__(self, *streams):
+        self._streams = streams
+    def write(self, data):
+        for s in self._streams:
+            try:
+                s.write(data)
+            except Exception:
+                pass
+    def flush(self):
+        for s in self._streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+# 与其他脚本的诊断日志同目录（data/merged）
+# 若想跟产物 CSV 放一起，把下面的 "merged" 改成 "cleaned" 即可
+LOG_DIR = os.path.join(BASE, "data", "merged")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_PATH = os.path.join(LOG_DIR, "03_clean_firm_modules_log.txt")
+
+_log_fh      = open(LOG_PATH, "w", encoding="utf-8")   # "w" 每次覆盖；想留历史见下方注释
+_orig_stdout = sys.stdout
+sys.stdout   = _Tee(_orig_stdout, _log_fh)
+
+def _close_log():
+    try:
+        _log_fh.flush(); _log_fh.close()
+    except Exception:
+        pass
+atexit.register(_close_log)          # 异常退出也能落盘
+
+print("=" * 70)
+print("03_clean_firm_modules.py — LOG")
+print(f"started : {datetime.now():%Y-%m-%d %H:%M:%S}")
+print(f"log file: {LOG_PATH}")
+print("=" * 70)
 
 MISSING_VALS = ["-", "n.a.", "n.s.", "NA", "N/A", "nan", ""]
 
@@ -88,6 +174,103 @@ def clean_missing(df):
             df.loc[mask, col] = df.loc[mask, col].replace('', np.nan)
     return df
 
+# ════════════════════════════════════════════════════════════════════════════
+# 通用覆盖率报告（2026-09-06 新增）
+#   遍历 df 全部列，按实体角色分组，标记低覆盖/全空，并对照 tar vs acq 同名指标
+# ════════════════════════════════════════════════════════════════════════════
+
+def _role_of(col):
+    c = col.lower()
+    if "tar_" in c: return "target"
+    if "acq_" in c: return "acquirer"
+    if "ven_" in c: return "vendor"
+    return "deal/other"
+
+def coverage_report(df, label, low=50.0, out_csv=None):
+    """
+    遍历 df 全部列输出覆盖率。
+      low     : 低于该百分比标 ⚠️
+      out_csv : 给定路径则同时保存明细表（含全部列，不只低覆盖的）
+    """
+    n = len(df)
+    print("\n" + "=" * 78)
+    print(f"COVERAGE REPORT — {label}   rows={n:,}  cols={len(df.columns)}")
+    print("=" * 78)
+
+    rows = []
+    for col in df.columns:
+        s = df[col]
+        c = col.lower()
+        is_id = (col == "deal_num") or any(p in c for p in ("name", "bvd_id", "orbis_id"))
+        n_raw = int(s.notna().sum())
+        if is_id:
+            n_num, kind = n_raw, "id"
+        else:
+            n_num = int(pd.to_numeric(s, errors="coerce").notna().sum())
+            kind = "num" if pd.api.types.is_numeric_dtype(s) else "str"
+        pct = n_raw / n * 100 if n else 0.0
+        rows.append(dict(column=col, role=_role_of(col), kind=kind,
+                         n_nonnull=n_raw, n_numeric=n_num, pct=round(pct, 2)))
+    rep = pd.DataFrame(rows)
+
+    # ── 汇总：按实体角色 ──
+    print("\n  [按实体角色汇总]")
+    for role, g in rep.groupby("role"):
+        sub = g[g["kind"] != "id"]
+        if len(sub) == 0: continue
+        n_empty = int((sub["n_nonnull"] == 0).sum())
+        flag = f"   ❌ 全空列 {n_empty} 个" if n_empty else ""
+        print(f"    {role:<12s} 变量 {len(sub):>3d} | 平均 {sub['pct'].mean():>5.1f}%"
+              f" | 中位 {sub['pct'].median():>5.1f}%{flag}")
+
+    # ── 对照：tar vs acq 同名指标（核心：一眼看出收购方侧是否整侧缺失）──
+    pairs = []
+    for t in [c for c in df.columns if "tar_" in c.lower()]:
+        a = t.replace("tar_", "acq_")
+        if a in df.columns and a != t:
+            tp = rep.loc[rep.column == t, "pct"].iloc[0]
+            ap = rep.loc[rep.column == a, "pct"].iloc[0]
+            pairs.append((t.replace("tar_", "*_"), tp, ap))
+    if pairs:
+        print("\n  [对照] 同名指标 tar vs acq   （Δ = acq − tar）")
+        print(f"    {'指标':<46s}{'tar%':>7s}{'acq%':>7s}{'Δ pp':>8s}")
+        for name, tp, ap in sorted(pairs, key=lambda x: x[2] - x[1]):
+            d = ap - tp
+            flag = "  ❌ acq全空" if (ap == 0 and tp > 0) else ("  ⚠️" if d < -20 else "")
+            print(f"    {name:<46s}{tp:>7.1f}{ap:>7.1f}{d:>+8.1f}{flag}")
+
+    # ── 数值化损失预警（字符串列转数字失败）──
+    loss = rep[(rep["kind"] != "id") & (rep["n_numeric"] < rep["n_nonnull"] * 0.99)]
+    if len(loss):
+        print("\n  ⚠️ [数值化损失] 含非数字字符，to_numeric 后部分变 NaN：")
+        for _, r in loss.iterrows():
+            print(f"    {r['column']:<46s} 非空 {r['n_nonnull']:>6,} → 可数值化 {r['n_numeric']:>6,}")
+
+    # ── 明细：低覆盖 / 全空 ──
+    detail = rep[(rep["pct"] < low) | (rep["n_nonnull"] == 0)].sort_values("pct")
+    print(f"\n  [明细] 覆盖率低于 {low}% 或全空（{len(detail)} / {len(rep)} 列）")
+    if len(detail) == 0:
+        print(f"    ✅ 无低于 {low}% 的列")
+    else:
+        for _, r in detail.iterrows():
+            tag = "❌全空" if r["n_nonnull"] == 0 else "⚠️低覆盖"
+            print(f"    {r['column']:<48s} {r['n_nonnull']:>7,}/{n:<7,} ({r['pct']:>5.1f}%) {tag}")
+
+    if out_csv:
+        rep.sort_values("pct").to_csv(out_csv, index=False, encoding="utf-8-sig")
+        print(f"\n  明细（全部列）已保存 -> {out_csv}")
+    print("=" * 78 + "\n")
+    return rep
+
+
+def audit_keep_list(df, keep_list, label):
+    """审计 KEEP 名单：抓『名单里写了不存在的列名』和『数据里有但被名单漏掉』"""
+    ghost   = [c for c in keep_list if c not in df.columns]
+    dropped = [c for c in df.columns if c not in keep_list]
+    print(f"\n[KEEP 名单审计] {label}")
+    print(f"  名单内但数据中不存在（列名写错？）: {ghost if ghost else '无 ✅'}")
+    print(f"  数据中有但被名单丢弃（{len(dropped)} 个）: {dropped if dropped else '无'}")
+    return ghost, dropped
 
 def stack_batches(files, label):
     """Read, ffill, and stack all batch files."""
@@ -253,7 +436,7 @@ def verify_f1_firm_ordering(df, label):
     verifying that the retained target BvD ID matches deal_master's first row.
     """
     DEAL_MASTER_PATH = os.path.join(
-        r"D:\FlashCenter\LQ",
+        #r"D:\MA",BASE,
         "data", "merged", "02_deal_master.csv"
     )
     try:
@@ -321,7 +504,6 @@ df_fin = dedup_by_deal(df_fin, "Module F")
 verify_f1_firm_ordering(df_fin, "Module F")
 
 # ── Select columns for analysis (empirical_design.md §4.7) ─────────────────
-# ── Select columns for analysis (empirical_design.md §4.7) ─────────────────
 FIN_KEEP = [
     "deal_num",
     # Entity identifiers
@@ -361,7 +543,7 @@ FIN_KEEP = [
     "pre_deal_ven_rev_rev_last_avail_yr",
     "pre_deal_ven_ta_last_avail_yr",
 ]
-
+audit_keep_list(df_fin, FIN_KEEP, "Module F")  
 FIN_KEEP_PRESENT = [c for c in FIN_KEEP if c in df_fin.columns]
 df_fin = df_fin[FIN_KEEP_PRESENT].copy()
 
@@ -389,10 +571,12 @@ check_pre_vars = [
     "pre_deal_acq_eq_last_avail_yr",
     "pre_deal_acq_pat_last_avail_yr"
 ]
-for v in check_pre_vars:
-    if v in df_fin.columns:
-        n = df_fin[v].notna().sum()
-        print(f"  {v:<45s}: {n:,} ({n/len(df_fin)*100:.1f}%)")
+#for v in check_pre_vars:
+    #if v in df_fin.columns:
+        #n = df_fin[v].notna().sum()
+        #print(f"  {v:<45s}: {n:,} ({n/len(df_fin)*100:.1f}%)")
+coverage_report(df_fin, "Module F — pre-deal",
+                out_csv=os.path.join(CLEANED, "_cov_moduleF_predeal.csv"))
 
 out_fin = os.path.join(CLEANED, "03_firm_financial_predeal.csv")
 df_fin.to_csv(out_fin, index=False, encoding="utf-8-sig")
@@ -403,7 +587,7 @@ print(f"\nSaved -> {out_fin}  ({os.path.getsize(out_fin)//1024:,} KB)")
 #   Source : raw/MA_firm/financial/acquisition_financial_1-4  (same raw files)
 #   Output : data/cleaned/03b_firm_financial_postdeal.csv
 #   Unit   : deal_num (one row per deal, first target row)
-#   Note   : Reuses already-stacked df_fin from Module F to avoid re-reading
+#   Note   : Re-reads the same raw files (Module F already saved to disk)
 # ════════════════════════════════════════════════════════════════════════════
 print("\n" + "=" * 60)
 print("MODULE Fb — Post-deal Snapshot (acquisition_financial_*)")
@@ -419,7 +603,7 @@ if "unnamed__0" in df_fin.columns:
     
 df_fin = dedup_by_deal(df_fin, "Module Fb")
 
-print(f"Reusing Module F dataframe: {len(df_fin):,} rows")
+print(f"Module Fb stacked: {len(df_fin):,} rows")
 
 # ── Select post-deal columns only ──────────────────────────────────────────
 FIN_POST_KEEP = [
@@ -463,7 +647,7 @@ FIN_POST_KEEP = [
     "post_deal_ven_shareholder_funds_1st_avail_yr",
     "post_deal_ven_cap",
 ]
-
+audit_keep_list(df_fin, FIN_POST_KEEP, "Module Fb") 
 FIN_POST_KEEP_PRESENT = [c for c in FIN_POST_KEEP if c in df_fin.columns]
 df_fin_post = df_fin[FIN_POST_KEEP_PRESENT].copy()
 
@@ -476,7 +660,6 @@ for col in FIN_POST_KEEP_PRESENT:
         df_fin_post[col] = pd.to_numeric(df_fin_post[col], errors="coerce")
 
 # Diagnostics
-# Diagnostics
 print(f"\nKey variable coverage (post-deal):")
 check_post_vars = [
     "post_deal_tar_rev_rev_1st_avail_yr",
@@ -488,17 +671,21 @@ check_post_vars = [
     "post_deal_acq_ebitda_1st_avail_yr",
     "post_deal_acq_shareholder_funds_1st_avail_yr"
 ]
-for v in check_post_vars:
-    if v in df_fin_post.columns:
-        n = df_fin_post[v].notna().sum()
-        total = len(df_fin_post)
-        print(f"  {v:<45s}: {n:,} ({n/total*100:.1f}%)")
-        
+
+#for v in check_post_vars:
+    #if v in df_fin_post.columns:
+        #n = df_fin_post[v].notna().sum()
+        #total = len(df_fin_post)
+        #print(f"  {v:<45s}: {n:,} ({n/total*100:.1f}%)")       
+# 替换原 check_post_vars 循环：
+coverage_report(df_fin_post, "Module Fb — post-deal",
+                out_csv=os.path.join(CLEANED, "_cov_moduleFb_postdeal.csv"))
         
 out_fin_post = os.path.join(CLEANED, "03b_firm_financial_postdeal.csv")
 df_fin_post.to_csv(out_fin_post, index=False, encoding="utf-8-sig")
 print(f"\nSaved -> {out_fin_post}  ({os.path.getsize(out_fin_post)//1024:,} KB)")
-print("df_fin全部原始列名：", df_fin.columns.tolist())
+if os.environ.get("DEBUG_03"):
+    print("df_fin全部原始列名：", df_fin.columns.tolist())
 # ════════════════════════════════════════════════════════════════════════════
 # Module G — Company Financial Time Series
 #   Source : raw/MA_firm/financial/acquisition_company_financial_1-7
@@ -587,8 +774,11 @@ CF_KEEP = [
     # Enterprise value (reference)
     "acq_ev_last_avail_yr"
 ]
+audit_keep_list(df_cf, CF_KEEP, "Module G")   
 CF_KEEP_PRESENT = [c for c in CF_KEEP if c in df_cf.columns]
 df_cf = df_cf[CF_KEEP_PRESENT].copy()
+coverage_report(df_cf, "Module G — company",
+                out_csv=os.path.join(CLEANED, "_cov_moduleG_company.csv"))
 # ==============================================
 # CAUTION: Batch numeric coercion for financial variables ONLY
 # Entity identifier columns (tar/acq name, BvD ID, Orbis ID) MUST be excluded here.
@@ -656,6 +846,7 @@ LEG_KEEP = [
     #"ven_incorp_d", "ven_incorp_d_year",
     #"ven_bvd_indep",
 ]
+audit_keep_list(df_leg, LEG_KEEP, "Module H")  
 LEG_KEEP_PRESENT = [c for c in LEG_KEEP if c in df_leg.columns]
 df_leg = df_leg[LEG_KEEP_PRESENT].copy()
 
@@ -686,11 +877,15 @@ for yr_col in [c for c in LEG_KEEP_PRESENT if c.endswith("_year")]:
     df_leg[yr_col] = pd.to_numeric(df_leg[yr_col], errors="coerce").astype("Int64")
 
 print(f"\nKey variable coverage:")
-for v in ["tar_status", "tar_incorp_d_year", "tar_bvd_indep"]:
-    if v in df_leg.columns:
-        n = df_leg[v].notna().sum()
-        print(f"  {v:<45s}: {n:,} ({n/len(df_leg)*100:.1f}%)")
+#for v in ["tar_status", "tar_incorp_d_year", "tar_bvd_indep"]:
+    #if v in df_leg.columns:
+       #n = df_leg[v].notna().sum()
+        #   print(f"  {v:<45s}: {n:,} ({n/len(df_leg)*100:.1f}%)")
 
+
+# 替换原 3 行循环（注意在 extract_inc_year 之后、out_leg 之前）：
+coverage_report(df_leg, "Module H — legal",
+                out_csv=os.path.join(CLEANED, "_cov_moduleH_legal.csv"))
 
 out_leg = os.path.join(CLEANED, "03_firm_legal.csv")
 df_leg.to_csv(out_leg, index=False, encoding="utf-8-sig")
@@ -938,9 +1133,12 @@ acq_adv_deal_cnt = int(df_adv_count["has_acq_advisor"].sum())
 tar_adv_pct = tar_adv_deal_cnt / total_unique_deals * 100
 acq_adv_pct = acq_adv_deal_cnt / total_unique_deals * 100
 
-print(f"\nAdvisor coverage across unique deals:")
-print(f"  Target-side any advisor: {tar_adv_deal_cnt:,} deals ({tar_adv_pct:.1f}%)")
-print(f"  Acquirer-side any advisor: {acq_adv_deal_cnt:,} deals ({acq_adv_pct:.1f}%)")
+#print(f"\nAdvisor coverage across unique deals:")
+#print(f"  Target-side any advisor: {tar_adv_deal_cnt:,} deals ({tar_adv_pct:.1f}%)")
+#print(f"  Acquirer-side any advisor: {acq_adv_deal_cnt:,} deals ({acq_adv_pct:.1f}%)")
+# 在 out_path_adv 之前，替换原 3 行 coverage print：
+coverage_report(df_adv_count, "Module J — advisor count",
+                out_csv=os.path.join(CLEANED, "_cov_moduleJ_advisor.csv"))
 
 # 删除tar_name/acq_name，避免后续多表merge产生_x/_y重名列冲突
 drop_name = ["tar_name", "acq_name"]
@@ -948,6 +1146,8 @@ df_adv_count = df_adv_count.drop(columns=[c for c in drop_name if c in df_adv_co
 
 print(f"\nModule J output: {len(df_adv_count):,} rows | {total_unique_deals:,} unique deals")
 print(f"\n【输出csv最终字段清单】{df_adv_count.columns.tolist()}")
+
+
 
 # 保存清洗完成中介计数表
 out_path_adv = os.path.join(CLEANED, "03b_firm_advisor_count.csv")
@@ -972,3 +1172,8 @@ for label, path in [
     size_kb = os.path.getsize(path) // 1024
     print(f"  {label:<30s} {size_kb:>6,} KB  |  "
           f"{pd.read_csv(path, usecols=['deal_num']).shape[0]:,} rows")
+    
+# ═══ 收尾：恢复控制台输出 ═══
+sys.stdout = _orig_stdout
+_log_fh.flush()
+print(f"\n日志已保存 -> {LOG_PATH}")
