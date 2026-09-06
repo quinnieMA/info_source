@@ -1,24 +1,32 @@
 # -*- coding: utf-8 -*-
 """
-Created on Sun Sep  6 06:34:53 2026
-
-@author: 13601
-"""
-
-"""
 Extract M&A Deal Comment Text Features with Loughran-McDonald Financial Dictionary
 Author: CC  Date: 2026-08-08
+Revised: 2026-09-06 — docstring aligned with actually-emitted columns;
+         regulatory measures demoted to SECONDARY
 Input Source: raw/MA_deal/acquisition_comments.csv
 Output Target: data/cleaned/01c_comments_features.csv
 Diagnostic Log: data/merged/01c_comments_diagnostics.txt
+
 Core Processing Logic:
 This script extracts structured numerical and textual sentiment metrics from Zephyr's raw deal comment editorial narratives,
 and eliminates bulky unstructured raw text columns before export to control file storage size.
+
 1. Text Sentiment Pipeline
     Load standard Loughran-McDonald (2011) financial word dictionary; build word-bound regular expressions
     for seven textual semantic categories: Positive, Negative, Uncertainty, Litigious, Strong_Modal, Weak_Modal, Constraining.
-    Calculate raw word count and normalized word density (word count / total text tokens) for each category,
-    plus net sentiment density (positive density minus negative density) as aggregate managerial tone proxy.
+    For each category emit a RAW COUNT (lm_*_count) and a BINARY PRESENCE flag (has_lm_*).
+
+    ⚠️ Columns NOT emitted (this docstring previously implied otherwise):
+      - lm_*_density       EMIT_LM_DENSITY = False. Median comment is ~88 words and
+                           most LM categories hit <1 time, so density = count/88 is
+                           not interpretable.
+      - lm_net_sentiment   Never computed. LM (2011) positive vs negative word lists
+                           differ ~6.6x in size (354 vs 2355), so a net score is
+                           systematically negative; the authors advise against it.
+      - deal_complexity_score  EMIT_COMPLEXITY = False (deprecated, code retained).
+                           See the note above calc_complex() for the four reasons.
+
 2. Deal Timeline & Negotiation Feature Extraction
     Use regular expressions to parse all date strings within comment text; derive earliest/latest event dates
     and total timeline span (days from first reported rumour to latest closing/update event).
@@ -26,17 +34,52 @@ and eliminates bulky unstructured raw text columns before export to control file
     unconditional offer, deal completion, Go-shop clause existence, Phase 2 antitrust investigation,
     regulatory remedy/divestment requirements, debt financing arrangements.
     Count metrics: total currency price mentions, unique regulatory bodies, competitive rival bidders.
-3. Transaction Complexity Composite Index
-    Aggregate weighted score (deal_complexity_score) combining competitive bidding, regulatory hurdles,
-    multi-round price revisions, debt financing and textual uncertainty density to measure overall M&A friction.
+
+3. Transaction Complexity Composite Index  → DEPRECATED, not emitted. See (1).
+
 4. Data Clean & Storage Optimization
-    Drop raw long-text fields (editorial, Deal rationale) before saving output CSV to avoid GB-level oversized files.
+    Drop raw long-text fields (comments, editorial, Deal rationale, reg_entity_list) before saving
+    output CSV to avoid GB-level oversized files.
     Only retain derived numerical features for subsequent master dataset merge in Script 02_merge_deal_master.py.
-Unit of Observation: Single editorial comment record (one row per Zephyr news entry per deal).
-Merge Key for Downstream: Integer deal_num (consistent with all other clean module files).
+
+──────────────────────────────────────────────────────────────────────────────
+⚠️ REGULATORY MEASURES HERE ARE SECONDARY — DO NOT USE AS PRIMARY (2026-09-06)
+──────────────────────────────────────────────────────────────────────────────
+  This module produces a TEXT-DERIVED regulatory measure by regex-scanning the
+  comment narrative:
+      reg_event_count, num_unique_reg, has_phase2_investigation, has_reg_remedy
+
+  It is NOT the primary regulatory measure. Two hard limitations:
+
+  (a) The keyword list (reg_keywords, 13 entries) covers almost exclusively
+      WESTERN ANTITRUST agencies — European Commission, CMA, FTC, DOJ, CADE,
+      SAMR, FCC. It contains NO securities/exchange regulators (CSRC, SEC,
+      SEBI, SFC, BaFin, ...). Deals reviewed through the securities route
+      therefore score 0 BY CONSTRUCTION.
+
+  (b) Coverage is ~1.84% of rows, versus ~12.8% for the STRUCTURED reg_*
+      variables built in 01b_deal_overview.py from the `regulatory_body_name`
+      field (443 distinct authority names, three-tier resolution). The text
+      measure misses roughly 7x as many reviewed deals.
+
+  ⇒ Empirical work uses the 01b structured reg_* variables.
+    The 01c text measures may serve only as a robustness / alternative measure.
+
+  (This is exactly the confusion recorded in 08b's docstring, which wrongly
+   attributed reg_antitrust / reg_securities to "01c comments". Those come
+   from 01b. Corrected 2026-09-06.)
+
+──────────────────────────────────────────────────────────────────────────────
+Unit of observation — VERIFY BEFORE RELYING ON IT:
+  Historically stated as "single editorial comment record (one row per Zephyr
+  news entry per deal)". Script 02 merges this file on deal_num and assumes a
+  ONE-TO-ONE match. If any deal carries more than one editorial, that merge
+  silently duplicates master rows. The diagnostics file reports both
+  `Total rows processed` and `Unique deal_num` — confirm they are EQUAL before
+  treating the 02 merge as safe.
+
 Dictionary Reference:
 Loughran, T., & McDonald, B. (2011). When are liability risk disclosures informative? Journal of Finance.
-Regulatory Keyword Library: Predefined list of global antitrust, financial and industrial supervisory authorities.
 """
 import re
 import os
