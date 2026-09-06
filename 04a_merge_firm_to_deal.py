@@ -1,48 +1,84 @@
 # -*- coding: utf-8 -*-
 """
-Created on Sat Aug 15 10:55:15 2026
+04a_merge_firm_to_deal.py
+=========================
+Merge cleaned firm modules into deal_master → 04a_deal_firm_full.csv.
 
-@author: Lenovo
-"""
-
-"""
-04_merge_firm_to_deal.py
-========================
-Merge cleaned firm data into deal_master to produce deal_firm_full.csv.
-
-Base   : data/merged/02_deal_master.csv            [58,691 rows, deal‑level, deal_num unique]
+Base   : data/merged/02_deal_master.csv   [deal × target grain]
 Merges :
-  Step 2 — 03_firm_financial_predeal.csv    on (deal_num,tar_bvd_id_num,acq_bvd_id_num)  [pre‑deal snapshot, deal‑tar‑acq granularity, ALLOW row expansion]
-  Step 3 — 03b_firm_financial_postdeal.csv on (deal_num,tar_bvd_id_num,acq_bvd_id_num)  [post‑deal snapshot, NEW]
-  Step 4 — 03_firm_financial_company.csv   on (deal_num,tar_bvd_id_num,acq_bvd_id_num)  [multi‑year time series]
-  Step 5 — 03_firm_legal.csv               on deal_num  [legal characteristics]
-  Step 6 — 03b_listed_status.csv           on deal_num  [listed status]
+  Step 2  — 03_firm_financial_predeal.csv     pre-deal snapshot   (Module F)
+  Step 3  — 03b_firm_financial_postdeal.csv   post-deal snapshot  (Module Fb)
+  Step 4  — 03_firm_financial_company.csv     multi-year series   (Module G)
+  Step 5  — 03_firm_legal.csv                 legal status        (Module H)
+  Step 6  — 03b_listed_status.csv             listed dummies      (Module I)
+  Step 5b — 03b_firm_advisor_count.csv        advisor counts      (Module J)
 
-Merge key:
-  - Step2/3/4: TRIPLE KEY = ["deal_num", "tar_bvd_id_num", "acq_bvd_id_num"]
-  - Step5/6/6b: simple key = "deal_num"
+──────────────────────────────────────────────────────────────────────────────
+MERGE KEY — FIVE columns, used by EVERY step (not three, not one)
+──────────────────────────────────────────────────────────────────────────────
+    MERGE_KEYS = [deal_num,
+                  tar_bvd_id_num, tar_orbis_id_num,
+                  acq_bvd_id_num, acq_orbis_id_num]
 
-NOTE: 02_deal_master is deal‑level (deal_num unique). 03‑series files are deal‑tar‑acq granularity,
-one deal_num can have multiple target‑acquiror records. Left‑join on triple‑key WILL expand rows.
-Row multiplication from business multi‑target is ALLOWED; only abusive many‑to‑many is blocked.
+  Historical note: Step 5 (legal) originally merged on deal_num alone, which
+  produced a Cartesian explosion because 03_firm_legal is (deal × tar × acq)
+  grain. Fixed 2026-08-15 — all steps now use the same five-column key.
 
-No ratio or derived variable construction here.
-All ratio variables (EBITDA Margin, Leverage, ROA, Revenue Growth)
-are computed in Stata at the analysis stage.
+  ⚠️ The key includes BOTH orbis_id columns. This makes matching STRICTER
+  than a three-column (deal, tar_bvd, acq_bvd) key: any deal whose orbis ID
+  is missing or inconsistent on either side will fail to match and will be
+  dropped by the inner joins below.
 
-Output : data/merged/04_deal_firm_full.csv
+──────────────────────────────────────────────────────────────────────────────
+JOIN TYPE — Steps 2-6 are INNER, only Step 5b is LEFT
+──────────────────────────────────────────────────────────────────────────────
+  ⚠️ Despite the function name assert_no_row_multiplication() and this
+  docstring's earlier claim of "left-join", Steps 2/3/4/5/6 all use
+  how="inner". Inner joins cannot expand rows — they DROP unmatched deals.
+
+  Consequence: the sample shrinks substantially here. Reverse-engineering
+  from downstream (table1 reads 08b at 18,191 rows against a 02 base of
+  ~58,691) implies roughly two thirds of observations are lost across this
+  script. The loss is driven upstream, not by a bug in 04a:
+      - Module 03 DROPS all multi-target deals (Step 3 of dedup_by_deal)
+      - Module 03 requires a complete acquirer identity triple
+        (acq_name + acq_bvd_id_num + acq_orbis_id_num)
+      - the five-column key additionally requires both orbis IDs
+  Deals failing any condition simply have no row in the 03 files, so the
+  inner join cannot retain them.
+
+  ⇒ This is the dominant source of attrition between 02 and 08b. It MUST be
+    documented as a sample-restriction step in the paper (Table 1 Panel A),
+    not treated as a silent merge detail.
+
+  Only Step 5b (advisors) is a left join; unmatched deals get num_* = 0.
+
+Row-expansion guard: assert_no_row_multiplication() permits up to 2x growth.
+  With inner joins the guard never fires — it is retained as a safety net in
+  case a merge is ever switched to "left".
+
+Derived variables constructed here (contrary to earlier docstring text):
+  has_tar_advisor, has_acq_advisor, has_any_advisor
+  all num_* advisor counts are fillna(0) → int
+No financial RATIO variables are built here; EBITDA margin, leverage, ROA
+and revenue growth are computed downstream (Stata / 05-08b).
+
+Output : data/merged/04a_deal_firm_full.csv
          data/merged/04_deal_firm_full_diagnostics.txt
+         data/merged/04_dup_deal_tar_acq_full.txt   (only if duplicate
+                                                     deal_num rows exist)
 
-Verification (plan §7 MODIFIED):
-  1. pre_deal_tar_ta_last_avail_yr non‑null rate >= 85%
-  2. tar_rev_rev_last_avail_yr non‑null rate >= 85%
-  3. acq_listed non‑null rate >= 85%
-Row‑count=58691 check removed; row expansion for multi‑target is permitted.
+Known dead code:
+  filter_valid_triple() is defined but never called. Its dropped= log line
+  is written as len(df)-len(df) and would always print 0. Harmless.
 
-Author: Zhaohua Li  Date: 2026‑04‑12
-adjusted: Qing  Date: 2026‑08‑03
-adjusted‑2: allow row expansion for multi‑target, drop strict 58691 row assertion
-adjusted‑3: Critical bugfix: NEVER rename triple join‑keys tar_bvd_id_num / acq_bvd_id_num
+Author: Zhaohua Li  Date: 2026-04-12
+adjusted: Qing  Date: 2026-08-03
+adjusted-2: allow row expansion for multi-target, drop strict row assertion
+adjusted-3: critical bugfix — never rename triple join keys
+Revised 2026-09-06: docstring corrected — six merges (Module J was missing),
+  five-column key used everywhere, Steps 2-6 are INNER not left, sample
+  attrition documented, output filename corrected to 04a_*.
 """
 
 import os
@@ -661,4 +697,4 @@ with open(diag_path, "w", encoding="utf‑8") as f:
     f.write("\n".join(diag_lines))
 log(f"Saved -> {diag_path}")
 
-log("\nScript 04 complete.")
+log("\nScript 04a complete.")
