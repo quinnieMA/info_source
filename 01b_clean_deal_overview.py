@@ -25,10 +25,81 @@ Regulatory variable taxonomy:
    reg_financial, reg_defense_tech
 3. Institutional legal attributes
    reg_cross_national: 1 if supranational regulator (EU, etc.) involved
+     — judged on BOTH the country field (regulatory_countries) AND the body
+       names themselves (REG_TRANSNATIONAL_BODIES), because the raw country
+       field is frequently blank or non-standard for EU-level authorities.
    reg_common_law / reg_civil_law / reg_mixed_legal: legal origin classification
+     — derived from regulatory_countries via exact country-name matching.
+       Coverage is partial and these are treated as INTERMEDIATE variables;
+       downstream scripts (04b) override them with the dedicated legal-origin
+       dataset. Do not use for final inference.
 4. Concatenated text identifiers
    regulatory_bodies, regulatory_countries: pipe-separated string of all matched bodies/countries
    for subsequent textual heterogeneity analysis
+
+──────────────────────────────────────────────────────────────────────────────
+REGULATORY BODY CLASSIFICATION — THREE-TIER RESOLUTION (2026-09-06)
+──────────────────────────────────────────────────────────────────────────────
+The regulator taxonomy is built by exhaustively enumerating every distinct
+value of `regulatory_body_name` in the raw overview files — NOT by guessing
+keyword lists. As of 2026-09-06 the raw files contain 443 distinct body names
+covering 6,623 deals with at least one recorded regulator.
+
+Resolution order (highest priority first), implemented in
+classify_regulatory_category():
+
+  Tier 1 — REG_EXACT_MAP   Explicit body-name fragment → category set.
+                           Highest priority; returns immediately on match.
+                           Covers major regulators that keyword matching
+                           systematically missed (MOFCOM, NDRC, SAFE,
+                           European Commission, CONSOB, CNMV, ...) and
+                           overrides wrong keyword hits.
+  Tier 2 — REG_EXCLUDE     Self-regulatory organisations and courts that do
+                           NOT constitute administrative merger approval —
+                           excluded from all categories. Examples: stock
+                           exchanges acting in listing capacity (Bursa/
+                           Malaysia Securities Exchange), Takeover
+                           Regulation Panel, National Company Law Tribunal,
+                           and courts/tribunals (Federal Court of Australia,
+                           Ontario Superior Court, NCLT).
+  Tier 3 — Keyword         Substring fallback. Short acronyms (<=4 chars:
+           fallback        sec, amb, nma, cade, doj, fsc, fca, fsa, amf,
+                           cma, sebi, sfc, csrc, cbirc, ...) require a WHOLE-
+                           WORD regex match; longer phrases use plain
+                           substring matching.
+
+Why the tiers exist — two defects found in the original keyword-only approach:
+
+  (a) Substring over-matching. The token "sec" matched any body name
+      containing the letters s-e-c (e.g. "Malaysia Securities Exchange"),
+      and "amb"/"nma" matched unrelated bodies (National Bank of Cambodia,
+      Swiss FINMA). All such hits are now either removed or overridden by
+      Tier 1. Whole-word matching alone reduced 'sec' hits to zero.
+  (b) severe under-coverage. 261 of 443 body names (2,572 of 6,623 deals,
+      ~39%) matched no keyword at all — including China's Ministry of
+      Commerce (429 deals), the European Commission (295), NDRC (113) and
+      SAFE (58). Tier 1 recovers these; residual unclassified bodies fell
+      from 2,572 to ~976 deals, and the remainder are almost entirely
+      names deliberately placed in REG_EXCLUDE.
+
+Deliberate scope decisions:
+  - China Banking and Insurance Regulatory Commission (CBIRC/CBRC) is coded
+    `financial`, NOT `securities`. Securities regulation in China is the
+    CSRC. A deal may still carry reg_securities=1 if a genuine securities
+    regulator (e.g. CSRC) also appears on the same deal — reg_* dummies are
+    deal-level ORs across all bodies attached to that deal.
+  - Multi-label bodies are permitted: a single regulator may set several
+    dummies (e.g. a combined financial supervisor sets both financial and
+    securities). The dummies are therefore NOT mutually exclusive.
+  - Ministry of Commerce (PRC) is coded `foreign_invest`. NOTE: between 2008
+    and 2018 China's anti-monopoly review of concentrations was conducted by
+    MOFCOM's Anti-Monopoly Bureau; it moved to SAMR in 2018. For pre-2018
+    deals this code understates antitrust involvement.
+
+Maintenance: when regulatory coverage looks wrong, re-enumerate the distinct
+body names first (do not add keywords blindly). The audit script writes
+  data/cleaned/_reg_body_full_list.csv   (all names + counts + categories)
+  data/cleaned/_reg_body_manual_map.csv  (blank manual_cat column template)
 
 Output file: data/cleaned/01b_deal_overview.csv
 Observation unit: (deal_num, tar_key) consistent deduplication logic with Module A
@@ -38,13 +109,25 @@ Processing notes:
 - Blank cascade rows with all missing values exist in raw overview source, unlike Module A industry file
   which retains partial firm metadata on cascade lines.
 - Regulatory aggregation executed prior to deduplication to avoid undercounting multi-authority deals.
+- Multi-target deals are RETAINED here (unlike Module 03, which drops them),
+  so the output row count (58,963) exceeds the unique deal count (55,586) by
+  3,377 rows. Downstream merges in 04a collapse to one row per deal_num.
+- The target-country distribution printed at the end of this module describes
+  the RAW, UNSCREENED overview universe. It is NOT the analysis sample —
+  China is heavily over-represented before the sample restrictions
+  (unlisted target x listed acquirer, deal value >= USD 1m, 2000-2024,
+  completed-date availability). See table1 Panel E for the analysis sample
+  composition.
 
 Author: CC  Date: 2026-08-08
+Revised: regulatory classification rebuilt on full body-name enumeration,
+         three-tier resolution, 2026-09-06
 """
 import os
 import glob
 import pandas as pd
 import numpy as np
+import re
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 BASE     = r"D:\MA"
@@ -83,7 +166,7 @@ def normalize_orbis_id(ser):
 # 监管分类常量不变
 REG_CATEGORY_KEYWORDS = {
     "antitrust": [
-        "competition", "antitrust", "anti-monopoly", "antimonopoly",
+        "competition", "antitrust","anti-trust","anti-monopoly", "antimonopoly",
         "monopoly", "kartell", "konkurr", "cade", "fair trade",
         "bundeskartellamt", "ftc", "department of justice", "doj",
         "dg competition", "wettbewerb", "concurrencia", "concurrence",
@@ -108,14 +191,14 @@ REG_CATEGORY_KEYWORDS = {
         "financial conduct authority", "fca",
         "bafin", "bundesanstalt für finanzdienstleistungsaufsicht",
         "commission de surveillance du secteur financier",
-        "guernsey financial services commission",
-        "jersey financial services commission",
+        #"guernsey financial services commission",
+        #"jersey financial services commission",
         "financial services board",
         "securities and exchange board", "sebi",
-        "financial regulatory authority",
+        #"financial regulatory authority",
         "monetary authority",
-        "china banking and insurance regulatory commission", "cbrc",
-        "cbirc",
+        #"china banking and insurance regulatory commission", "cbrc",
+        #"cbirc",
     ],
     "state_assets": [
         "state-owned assets supervision", "sasac",
@@ -169,17 +252,146 @@ CIVIL_LAW_COUNTRIES = {
 
 TRANSNATIONAL_REGULATORS = {"European Union", "EU", "European Commission"}
 
+# ════════════════════════════════════════════════════════════════════════════
+# 精确机构名映射（2026-09-06，基于 443 个唯一机构名全量枚举）
+# 优先级：精确映射 > 排除清单 > 关键词兜底
+# ════════════════════════════════════════════════════════════════════════════
+
+REG_EXCLUDE = {
+    "malaysia securities exchange", "securities industry council",
+    "takeover regulation panel", "chamber of the amsterdam court of appeal",
+    "the federal court of australia", "ontario superior court of justice",
+    "supreme court of british columbia", "national company law tribunal",
+    "federal court", "high court", "court of appeal", "supreme court",
+}
+
+REG_TRANSNATIONAL_BODIES = {
+    "european commission", "european council", "european parliament",
+    "council of the european union", "european central bank",
+    "european banking authority",
+    "european securities and markets authority",
+    "european insurance and occupational pensions authority",
+    "directorate general for competition",
+}
+
+REG_EXACT_MAP = {
+    # ── 中国：银行业监管明确排除出 securities ──
+    "china banking and insurance regulatory commission": {"financial"},
+    "cbirc":                                      {"financial"},
+    "cbrc":                                       {"financial"},
+    # ── 综合金融监管：归 financial，不归 securities ──
+    "financial regulatory authority":             {"financial"},
+    "guernsey financial services commission":     {"financial"},
+    "jersey financial services commission":       {"financial"},
+    # ── 中国 ──
+    "ministry of commerce":                       {"foreign_invest"},
+    "national development and reform commission": {"state_assets"},
+    "state administration of foreign exchange":   {"foreign_invest"},
+    "industrial & commercial administration bureau": {"state_assets"},
+    "ministry of finance":                        {"financial"},
+    "national administration of financial regulation": {"financial"},
+    "china's state council":                      {"state_assets"},
+    "state council":                              {"state_assets"},
+    # ── 超国家 ──
+    "european commission":                        {"antitrust"},
+    # ── 反垄断 ──
+    "anti-trust authority":                       {"antitrust"},
+    "comisión nacional de la competencia":        {"antitrust"},
+    "comision nacional de los mercados y la competencia": {"antitrust"},
+    "comisión federal de competencia":            {"antitrust"},
+    "autoridade de concorrencia":                 {"antitrust"},
+    "autoriteit consument en markt":              {"antitrust"},
+    "office of fair trading":                     {"antitrust"},
+    "gazdasagi versenyhivatal":                   {"antitrust"},
+    "konkurentsiamet":                            {"antitrust"},
+    "lietuvos respublikos konkurencijos taryba":  {"antitrust"},
+    "commerce commission":                        {"antitrust"},
+    "illinois commerce commission":               {"antitrust"},
+    # ── 证券 ──
+    "consob":                                     {"securities"},
+    "comision nacional del mercado de valores":   {"securities"},
+    "komisija za hartije od vrjednosti":          {"securities"},
+    "federal service for financial markets":      {"securities"},
+    "finanstilsynet":                             {"securities"},
+    "finansinspektionen":                         {"securities"},
+    "autoriteit financiële markten":              {"securities"},
+    "croatian agency for the supervision of financial services": {"securities"},
+    "financial supervisory authority":            {"securities"},
+    "egyptian financial supervisory authority":   {"securities"},
+    "capital market authority":                   {"securities"},
+    "capital markets authority":                  {"securities"},
+    "capital markets board":                      {"securities"},
+    "superintendencia financiera de colombia":    {"securities"},
+    "australian securities and investments commission": {"securities"},
+    "swiss financial market supervisory authority": {"securities"},
+    "securities & commodities authority":         {"securities"},
+    "securities market agency":                   {"securities"},
+    "comissão de valores mobiliários":            {"securities"},
+    "comissão do mercado de valores mobiliários": {"securities"},
+    "autorité des services et marchés financiers": {"securities"},
+    # ── 金融/央行 ──
+    "bank negara malaysia":                       {"financial"},
+    "federal reserve board":                      {"financial"},
+    "bank of italy":                              {"financial"},
+    "office of the comptroller of the currency":  {"financial"},
+    "national bank of cambodia":                  {"financial"},
+    "central bank of mozambique":                 {"financial"},
+    "nepal rastra bank":                          {"financial"},
+    "federal energy regulatory commission":       {"financial"},
+    "prudential regulation authority":            {"financial"},
+    # ── 外资 ──
+    "overseas investment office":                 {"foreign_invest"},
+    "ministry of international trade and industry": {"foreign_invest"},
+    "ministry of economic affairs":               {"foreign_invest"},
+    # ── 行业 ──
+    "agência nacional de energia elétrica":       {"financial"},
+    "agência nacional de telecomunicações":       {"defense_tech"},
+    "federal communications commission":          {"defense_tech"},
+    # ── 第三轮：补剩余漏网 ──
+    "kilpailuvirasto":                            {"antitrust"},   # 芬兰竞争局
+    "australian prudential regulatory authority": {"financial"},   # 澳审慎监管局
+    "australian prudential regulation authority": {"financial"},
+    "bureau of internal revenue":                 {"financial"},
+    "ministry of domestic trade and consumer affairs": {"financial"},
+    "agência nacional de saúde suplementar":      {"financial"},
+}
+
+def _norm(s):
+    """标准化机构名：小写 + 压缩空白"""
+    return " ".join(str(s).lower().split())
+
 def classify_regulatory_category(body_name):
+    """
+    精确映射优先 → 排除清单 → 关键词兜底
+    """
     if pd.isna(body_name):
         return set()
-    name_lower = str(body_name).lower()
-    categories = set()
+    raw = str(body_name).strip()
+    nm  = _norm(raw)
+
+    # ① 精确映射（最高优先级，直接返回）
+    for frag, cats in REG_EXACT_MAP.items():
+        if _norm(frag) in nm:
+            return set(cats)
+
+    # ② 排除清单（交易所自律组织/法院，不算监管审批）
+    for bad in REG_EXCLUDE:
+        if _norm(bad) in nm:
+            return set()
+
+    # ③ 关键词兜底；短缩写加词边界，防 "sec"/"amb"/"nma" 误伤
+    cats = set()
     for cat, keywords in REG_CATEGORY_KEYWORDS.items():
         for kw in keywords:
-            if kw.lower() in name_lower:
-                categories.add(cat)
+            kwl = kw.lower()
+            if len(kwl) <= 4:                      # 短缩写必须全词匹配
+                if re.search(rf"\b{re.escape(kwl)}\b", nm):
+                    cats.add(cat)
+                    break
+            elif kwl in nm:
+                cats.add(cat)
                 break
-    return categories
+    return cats
 
 def is_common_law_country(country):
     if pd.isna(country):
@@ -211,9 +423,19 @@ def build_regulatory_variables(df_full_raw):
         reg_agg[col_name] = reg_agg["regulatory_bodies"].apply(
             lambda bodies: any(cat in classify_regulatory_category(b) for b in bodies.split("|") if b)
         ).astype(int)
-    reg_agg["reg_cross_national"] = reg_agg["regulatory_countries"].apply(
-        lambda countries: any(is_transnational(c) for c in countries.split("|") if c)
+    def _is_transnational_body(bodies_str):
+        """任一机构名匹配跨国名单即算跨国监管"""
+        parts = [p.strip() for p in str(bodies_str).split("|") if p.strip()]
+        return any(any(_norm(t) in _norm(p) for t in REG_TRANSNATIONAL_BODIES)
+                   for p in parts)
+    
+    reg_agg["reg_cross_national"] = reg_agg.apply(
+        lambda r: int(
+            any(is_transnational(c) for c in str(r["regulatory_countries"]).split("|") if c)
+            or _is_transnational_body(r["regulatory_bodies"])
+        ), axis=1
     ).astype(int)
+
     reg_agg["reg_common_law"] = reg_agg["regulatory_countries"].apply(
         lambda countries: any(is_common_law_country(c) for c in countries.split("|") if c)
     ).astype(int)
@@ -222,7 +444,6 @@ def build_regulatory_variables(df_full_raw):
     ).astype(int)
     reg_agg["reg_mixed_legal"] = ((reg_agg["reg_common_law"] == 1) & (reg_agg["reg_civil_law"] == 1)).astype(int)
     return reg_agg
-
 # ==================== 主程序 ====================
 print("============================================================")
 print("MODULE E — Overview + Country (Fix Series ValueError)")
@@ -335,8 +556,20 @@ print(f"Deals with regulatory review: {reg_has:,} ({reg_has/total_rows*100:.1f}%
 print(f"Max regulatory bodies per single deal: {df_ovw['reg_body_count'].max()}")
 
 print("\nTop20 target country distribution:")
+print("  " + "⚠️" * 3 + " 以下为【原始 overview 文件，未经任何样本筛选】的国别构成")
+print("      含大量小额 / 非上市收购方 / 无完成日期的交易，")
+print("      不代表最终分析样本。分析样本构成见 table1 Panel E。")
 print(df_ovw["tar_country_code"].value_counts().head(20).to_string())
+print(f"多标的交易导致的额外行数: {len(df_ovw) - df_ovw['deal_num'].nunique():,}")
 
+# 补充：reg_* 变量实际生效的子集
+if "reg_body_count" in df_ovw.columns:
+    _sub = df_ovw[df_ovw["reg_body_count"] > 0]
+    print(f"\n【附】有监管记录的子集 N={len(_sub):,} 行 "
+          f"(unique deal {_sub['deal_num'].nunique():,})")
+    print("      reg_* 变量仅在此子集内非零：")
+    print(_sub["tar_country_code"].value_counts().head(10).to_string())
+    
 # 保存文件
 out_path = os.path.join(CLEANED, "01b_deal_overview.csv")
 df_ovw.to_csv(out_path, index=False, encoding="utf-8-sig")
