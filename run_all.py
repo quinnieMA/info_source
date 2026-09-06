@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Created on Sun Aug 16 11:55:17 2026
-
+revised on  2026-09-06
 @author: 13601
 """
 
@@ -18,7 +18,7 @@ MA_ROOT = r"D:\MA"
 os.chdir(MA_ROOT)
 # 脚本顺序 = 论文数据生成顺序（别动）
 STEPS = [
-    "01_clean_deal_modules",
+    "01a_clean_deal_modules",
     "01b_clean_deal_overview",
     "01c_clean_deal_comments",
     "02_merge_deal_master",
