@@ -1,7 +1,8 @@
 """
 02_merge_deal_master.py
 =======================
-Merge all standardized cleaned module CSV files into one unified master dataset at deal-target observation level.
+Merge all standardized cleaned module CSV files into one unified master dataset
+at deal-target observation level.
 
 Input Cleaned Modules (data/cleaned/):
 1. Base table: 01_deal_sic_industry.csv (Unit: deal_num + tar_key, core firm & SIC identifiers)
@@ -9,9 +10,50 @@ Input Cleaned Modules (data/cleaned/):
    - 01_deal_multiples.csv: valuation multiples
    - 01_deal_structure_date.csv: transaction status & time variables
    - 01_deal_value.csv: consideration value & acquired ownership share
-   - 01b_deal_overview.csv: country tags, regulatory metadata & brief deal text
+   - 01b_deal_overview.csv: country tags, STRUCTURED regulatory metadata & brief deal text
    - 01_deal_info_source_count.csv: disclosure source count dummy indicators
    - 01c_comments_features.csv: Loughran-McDonald sentiment & negotiation friction metrics
+
+──────────────────────────────────────────────────────────────────────────────
+⚠️ TWO DISTINCT REGULATORY MEASURES — DO NOT CONFUSE (2026-09-06)
+──────────────────────────────────────────────────────────────────────────────
+  (A) STRUCTURED — reg_* from Module E (01b_deal_overview.csv)  ← PRIMARY
+      reg_antitrust, reg_securities, reg_state_assets, reg_foreign_invest,
+      reg_financial, reg_defense_tech, reg_body_count, reg_country_count,
+      reg_cross_national, reg_common_law, reg_civil_law, reg_mixed_legal,
+      regulatory_bodies, regulatory_countries
+
+      Derived from `regulatory_body_name` — the NAME OF THE REGULATORY
+      AUTHORITY recorded in the raw overview files. NOT from deal comments.
+      Built by exhaustively enumerating all 443 distinct authority names,
+      then resolving each via a three-tier scheme in 01b:
+        Tier 1  REG_EXACT_MAP   explicit body-name → category (highest priority)
+        Tier 2  REG_EXCLUDE     exchanges / courts → no category
+        Tier 3  keyword         substring fallback (short acronyms need
+                                whole-word match)
+      reg_* dummies are deal-level ORs across ALL bodies on that deal and are
+      NOT mutually exclusive (a combined supervisor sets several).
+
+  (B) TEXT-DERIVED — from Module F (01c_comments_features.csv)  ← SECONDARY
+      reg_event_count, num_unique_reg
+
+      Counted from comment TEXT via keyword scanning. Coverage is low and
+      partially conflates mention-frequency with review intensity.
+
+  Empirical work uses (A). (B) may serve as a robustness / alternative
+  measure only. Any docstring or table note claiming reg_* comes from
+  comments is WRONG — see 08b docstring, corrected 2026-09-06.
+
+──────────────────────────────────────────────────────────────────────────────
+Merge key asymmetry (important):
+  - Modules B, C, D, F are deal-level: merged on `deal_num` only.
+  - Module E (01b) is (deal_num × target) level: it RETAINS multi-target
+    deals (unlike Module 03, which drops them), so its row count (58,963)
+    exceeds its unique deal count (55,586) by 3,377 rows. It is therefore
+    merged on the composite key (deal_num, _tar_key), where
+        _tar_key = tar_bvd_id_num.fillna(tar_name)
+    Do NOT "simplify" this to deal_num-only — it would reintroduce row
+    duplication.
 
 Output Files:
     data/merged/02_deal_master.csv        Full integrated master panel
@@ -21,9 +63,15 @@ Processing Notes:
   - No sample screening filters implemented here. Sample restrictions (year range, stake threshold, deal value floor) are applied in the subsequent empirical design script Step 5.
   - Duplicate identifier fields (tar_name, acq_name, deal_status, deal_value) exist across separate raw modules for cross-source validation. Duplicated columns are suffixed with _ovw/_mul/_sd/_val and compared in diagnostic logs to quantify data inconsistency rates.
   - 01c_comments_features only retains numerically derived sentiment & timeline features; raw unstructured long text columns are discarded before merging to control output file size.
-  All left joins use the base industry table as anchor; transactions without matching target SIC records are permanently dropped.
+  - All left joins use the base industry table as anchor; transactions without matching target SIC records are permanently dropped.
+  - Country codes carried in from Module E are RAW and UNSCREENED. They are
+    not the analysis-sample composition (China is heavily over-represented
+    before sample restrictions). Do not quote Module E's country
+    distribution as the sample composition — see table1 Panel E instead.
 
 Author: Q Date: 2026-08-08
+Revised 2026-09-06: documented the two distinct regulatory measures and the
+    Module E composite merge key.
 """
 
 import os
@@ -287,7 +335,9 @@ df = df.merge(df_src_dummy, on="deal_num", how="left")
 
 # 没有来源记录的deal全部填充0（没有该类来源）
 src_dummy_cols = [c for c in df_src_dummy.columns if c.startswith("num_")]
-df[src_dummy_cols] = df[src_dummy_cols].fillna(0)
+#df[src_dummy_cols] = df[src_dummy_cols].fillna(0)
+df["has_source_record"] = df[src_dummy_cols].notna().any(axis=1).astype("Int64")
+# 保留 NaN，不 fillna(0)
 
 # QC：统计各个来源非零样本数量
 log("\nSource‑count variable QC (non‑zero count):")
@@ -307,8 +357,6 @@ log("=" * 60)
 df_cmt = pd.read_csv(os.path.join(CLEANED, "01c_comments_features.csv"),
                      encoding="utf-8-sig", low_memory=False)
 df_cmt["deal_num"] = pd.to_numeric(df_cmt["deal_num"], errors="coerce").astype("Int64")
-
-log(f"Comments feat rows: {len(df_cmt):,} | unique deals: {df_cmt['deal_num'].nunique():,}")
 
 # F2/M4统计无匹配交易
 _deal_master_set = set(df["deal_num"].dropna().astype(int).tolist())
@@ -331,14 +379,23 @@ df = df.merge(df_cmt, on="deal_num", how="left")
 # 全量LM+交易特征覆盖率诊断
 log("\nComments-feature non-null coverage:")
 CMT_KEY_VARS = [
+    # 时序 / 里程碑
     "total_timeline_days", "has_rumour", "has_target_reject",
-    "has_phase2_investigation", "num_unique_reg", "has_goshop",
-    "deal_complexity_score",
-    "lm_pos_density", "lm_neg_density", "lm_uncertain_density",
-    "lm_litigious_density",
-    "lm_strongmodal_density", "lm_weakmodal_density", "lm_constrain_density",
-    "lm_net_sentiment",
-    "comment_wordcount",
+    "has_unconditional_offer", "has_deal_complete",
+    # 价格 / 竞标
+    "price_event_num", "max_premium_pct", "avg_premium_pct", "rival_bidder_num",
+    # 条款 / 救济 / 融资
+    "has_goshop", "has_reg_remedy", "has_debt_assumption",
+    # 监管（文本口径，覆盖率低；主口径用 01b 的 reg_*）
+    "reg_event_count", "num_unique_reg",
+    # 文本长度（回归控制用）
+    "comment_wordcount", "log_comment_wordcount", "comment_char_length",
+    # LM 计数
+    "lm_pos_count", "lm_neg_count", "lm_uncertain_count", "lm_litigious_count",
+    "lm_strongmodal_count", "lm_weakmodal_count", "lm_constrain_count",
+    # LM 二值 presence（主口径）
+    "has_lm_pos", "has_lm_neg", "has_lm_uncertain", "has_lm_litigious",
+    "has_lm_strongmodal", "has_lm_weakmodal", "has_lm_constrain",
 ]
 for v in CMT_KEY_VARS:
     if v in df.columns:
@@ -414,7 +471,7 @@ if "tar_primary_sic_code" in df.columns and "acq_primary_sic_code" in df.columns
 
 # QC: count non-null for key derived features
 log("\nComments-feature QC (non-null count):")
-CMT_KEY_VARS = [
+CMT_KEY_VARS = [ #此处有重复定义，不影响结果，待处理
     "total_timeline_days", "has_rumour", "has_target_reject",
     "has_phase2_investigation", "num_unique_reg", "has_goshop",
     "deal_complexity_score",
