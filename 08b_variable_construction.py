@@ -1,28 +1,44 @@
 # -*- coding: utf-8 -*-
 """
-0b8_variable_construction.py
+08b_variable_construction.py
 Date: 2026-04-15
-Last Updated: 2026-08-08
-Purpose: Construct all regression-ready firm, transaction, textual sentiment and regulatory variables; export cleaned balanced panel to Stata .dta format.
+Last Updated: 2026-09-06
+Purpose: Construct all regression-ready firm, transaction, textual sentiment and
+regulatory variables; export the analysis dataset to Stata .dta format.
+
+NOTE ON "panel": the output is a cross-section of DEAL observations (one row per
+deal × target-acquirer pair), NOT a balanced panel — there is no time dimension.
 
 Pipeline Inputs:
     1. data/merged/07_deal_firm_benchmark.csv
        Core focal deal panel merged with Doc2Vec text similarity & SIC peer benchmark identifiers
     2. data/merged/04b_deal_firm_country.csv
        Full global firm corpus for peer financial characteristic calculation
-    Derived Inputs (integrated via prior merge scripts, no raw file import):
-       Regulatory metadata, disclosure source dummies, Loughran-McDonald comment sentiment metrics from Module F
+
+    Derived inputs already merged upstream (no raw file read here):
+       - Regulatory metadata          <- 01b_deal_overview.csv (Script 01 Module E)
+       - Disclosure source dummies    <- 01_deal_info_source_count.csv (via 02)
+       - LM comment sentiment metrics <- 01c_comments_features.csv (Script 01c)
+
+    ⚠️ MODULE LETTERS COLLIDE ACROSS SCRIPTS:
+       "Module F" means the COMMENTS file in Script 01/02, but the PRE-DEAL
+       FINANCIAL snapshot in Script 03. Always cite the FILENAME, never the
+       letter.
 
 Core Output:
     data/merged/08b_deal_firm_analysis.dta
-    Stata-compatible analysis dataset containing all constructed control, independent, heterogeneity & friction variables
+    Stata-compatible analysis dataset containing all constructed control,
+    independent, heterogeneity & friction variables
 
-Variable Construction Catalogue:
+──────────────────────────────────────────────────────────────────────────────
+VARIABLE CONSTRUCTION CATALOGUE
+──────────────────────────────────────────────────────────────────────────────
+
 1. Valuation Multiples (Raw & Log Transformed)
     ln_mul_{rev,ebitda,ebit}          Log pre-transaction target valuation multiples
-    ln_text_{rev,ebitda}              Log Doc2Vec text peer median multiples
-    ln_sic_{rev,ebitda,ebit}          Log SIC industry peer median multiples
     ln_post_mul_{rev,ebitda,ebit}     Log post-transaction operating multiples
+    ln_text_{rev,ebitda,ebit}         Log Doc2Vec text peer median multiples
+    ln_sic_{rev,ebitda,ebit}          Log SIC industry peer median multiples
 
 2. Target & Acquirer Fundamental Ratios (Pre / Post Deal, Winsorised 1%/99%)
     tar_ebitda_margin, tar_leverage, tar_rev_growth, tar_roa
@@ -31,70 +47,188 @@ Variable Construction Catalogue:
     acq_post_ebitda_margin, acq_post_roa, acq_post_leverage
     ln_tar_size, ln_acq_size, ln_tar_post_size, ln_acq_post_size
     ln_rel_size: Log acquirer / target total asset relative scale
+    NOTE: ln_rel_size = ln_acq_size − ln_tar_size. It is EXACTLY collinear with
+          the two level terms — never include all three in one regression.
 
 3. Firm Age Controls (2026-07-27 Addition)
     target_age: Deal year minus target incorporation year
     acquirer_age: Deal year minus acquirer incorporation year
+    Negative ages (incorporation after deal year) set to NaN.
 
 4. Listing Status Dummies
-    tar_listed, acq_listed (1 = exchange ticker exists in raw Zephyr source)
+    tar_listed, acq_listed (1 = exchange AND ticker both present in Zephyr)
 
-5. Transaction Time Horizon
+5. Transaction Time Horizon — see the DURATION CLEANING note below
     DaysToCompletion: Calendar days from formal announcement to close
     ln_days: Natural log of completion duration
 
+──────────────────────────────────────────────────────────────────────────────
+⚠️ DURATION CLEANING (STEP 6) — MATERIAL FOR REPLICATION, READ BEFORE USING ln_days
+──────────────────────────────────────────────────────────────────────────────
+  Two classes of Zephyr MECHANICAL placeholder dates are removed before
+  DaysToCompletion is computed. Both are database artefacts, not real durations:
+
+  (a) THE 730-DAY CLUSTER. When completed_d is missing, Zephyr sets
+      assumed_comp_d = announced_d + 730 as an extrapolation placeholder. Any
+      row where completed_d is null AND (assumed_comp_d − announced_d) falls in
+      [700, 760] has assumed_comp_date set to NaT. Without this rule the
+      duration variable is dominated by a spurious spike at exactly 730 days.
+
+  (b) ZERO-DURATION FILLS. When announced_d is missing, Zephyr copies
+      completed_d into it, yielding DaysToCompletion = 0. Rows where
+      completed_date == announced_date have completed_date set to NaT.
+
+  end_date = completed_date, falling back to assumed_comp_date.
+  DaysToCompletion <= 0 is then set to NaN; ln_days = log(DaysToCompletion).
+
+  ⇒ The count of rows removed by each rule is printed in the log. Report these
+    numbers when documenting the duration variable in the paper.
+
+──────────────────────────────────────────────────────────────────────────────
 6. Peer Benchmark Aggregates (Table 6 Descriptive Regressions)
     text_peer_*_median: Median financial metrics of text-similarity peer group
-    sic_peer_*_median: Median financial metrics of same SIC3 industry peer group
-    peer_overlap_frac: Fraction of text peers overlapping with SIC peer set
-    text_same_sic{1,2,3,4}_frac: Share of text peers matching target SIC depth
-    sic_same_sic{1,2,4}_frac: Share of SIC peers matching target narrow industry
+    sic_peer_*_median:  Median financial metrics of same SIC3 industry peer group
+    Additional peer medians: *_ta_median, *_rev_median, *_ebitda_margin_median,
+        *_leverage_median, *_rev_growth_median, *_roa_median,
+        *_ev_ebitda_median, *_ev_rev_median, *_ev_ebit_median,
+        *_mktcap_median, *_ev_median, *_mb_median
+    Focal-side Table 6 columns: tar_ta_for_t6, tar_rev_for_t6,
+        tar_mktcap_for_t6, tar_ev_for_t6, tar_mb_for_t6
 
-7. Cross-Industry Heterogeneity Proxies
+    ⚠️ MIN_PEERS IS NOT ENFORCED. MIN_PEERS = 3 is defined as a module
+      parameter, but compute_peer_metrics() never references it — it only
+      checks `if n > 0`. Peer medians are therefore computed even for a single
+      peer. The "minimum 3 peers" rule stated in earlier versions of this
+      docstring was aspirational, not implemented. If you want it, add
+      `if len(peer_ids) < MIN_PEERS: return result` after the peer_ids parse.
+
+7. FinSimGap Distance Components (built in STEP 7, previously undocumented)
+    dist_comp:  Standardised Euclidean distance, focal to centroid of peers
+                having all three dimensions non-NaN (D2 formula)
+    dist_ebitda / dist_lev / dist_grow: Mean absolute per-dimension gap
+    All sub-distances and the composite use the SAME peer subset
+    (all three z-dims non-NaN). Using different subsets per dimension
+    previously made the composite incoherent.
+    Peer ratios are pre-filtered (denominator >= 100k) then winsorised 1/99
+    BEFORE standardisation — without this, near-zero denominators produce
+    ratios above 1e6 and the z-scores collapse to noise.
+
+8. Cross-Industry Heterogeneity Proxies
     cross_industry_alt: Alternative cross-industry indicator (peer overlap < 50%)
     cross_industry: Baseline SIC3 mismatch dummy (retained for comparison)
+    peer_overlap_frac: Fraction of TEXT peers that also appear in the SIC peer
+        set. ASYMMETRIC by design — denominator is len(text peers), not the
+        union. Document this definition in any table note.
 
-8. Legal Origin Institutional Controls (La Porta et al. 1998)
-    legal_origin: Categorical (English / French / German / Scandinavian)
-    common_law: Binary 1 = English common law jurisdiction
-    national_class: 1 = Country adopts NAICS industrial classification
-    sic_coverage_rate: Country-level valid SIC code share (industry data quality proxy)
-    classification_distance: Ordinal 0-4 distance from US SIC mapping noise proxy
+9. SIC Affiliation & Similarity (Table 7)
+    text_same_sic{1,2,3,4}_frac: Share of text peers matching target SIC depth
+    sic_same_sic{1,2,3,4}_frac:  Share of SIC peers matching target SIC depth
+        (sic_same_sic3_frac is ~1 by construction; kept for verification)
+    text_sim_same_sic{lv}_mean / text_sim_diff_sic{lv}_mean, lv in 1..4:
+        Mean Doc2Vec similarity to same-SIC vs different-SIC text peers
+    sic_peer_sim_mean: Mean cosine similarity to SIC peers (needs the Doc2Vec
+        model at data/models/doc2vec_full_corpus.model; NaN if load fails)
 
-9. Regulatory Review Metadata (From  01c comments)
-    reg_body_count, reg_country_count
-    reg_antitrust / reg_securities / reg_state_assets / reg_foreign_invest / reg_financial / reg_defense_tech
-    reg_cross_national, reg_common_law, reg_civil_law, reg_mixed_legal
+10. Legal Origin Institutional Controls (La Porta et al. 1998)
+    ⚠️ VARIABLE NAMES ARE ROLE-SUFFIXED. The bare names legal_origin and
+       common_law are COMMENTED OUT in the code. What is actually produced:
+         legal_origin_tar / legal_origin_acq   (English / French / German /
+                                                Scandinavian)
+         common_law_tar   / common_law_acq     (1 = English common law)
+       Unmapped country codes yield NaN and are listed in the log.
+    national_class: 1 = target country uses NAICS (US, CA, MX)
+    sic_coverage_rate: Country-level valid SIC3 share, computed on the FULL
+        corpus (04b), not the analysis sample — the sample has SIC3 by
+        construction, so computing it there would give 100% and no variation.
 
-10. M&A Advisor Count Aggregates (Module J)
-    tar_total_advisor, acq_total_advisor: Sum of advisor type dummy indicators
+    ⚠️ SIC-1 is a NON-STANDARD shorthand: first digit of the 3-digit SIC code
+       (0-9). Standard SIC Divisions use letter ranges. Footnote this.
 
-11. Information Disclosure Source Metrics (Module E)
-    total_info_source: Total distinct disclosure channels per transaction
+11. Classification Distance (H3 continuous moderator)
+    classification_distance_tar / classification_distance_acq
+    Ordinal 0-4 distance from the US SIC mapping system (0 = NAICS-native,
+    4 = China CSRC). Used as the running variable in table2/table3.
+    ⚠️ NOT a continuous "information environment" index: diagnostics show the
+       securities-review share is NON-MONOTONIC across levels
+       (0% / 4.0% / 1.4% / 3.1% / 45.6%). Treat as a categorical regime
+       indicator; do not interpret as a transparency gradient.
 
-12. Deal Comment Negotiation & Sentiment Features (01c comments, 2026-08-08 New)
-    Derived from Zephyr editorial comment text via Loughran-McDonald 2011 financial lexicon
-    Timeline & negotiation friction flags:
-        total_timeline_days, has_rumour, has_target_reject, has_phase2_investigation, has_goshop
-    Regulatory complexity metrics: num_unique_reg
-    Composite friction index: deal_complexity_score
-    L-M word count raw totals: lm_pos_count, lm_neg_count, lm_uncertain_count, lm_litigious_count, lm_strongmodal_count, lm_weakmodal_count, lm_constrain_count
-    Standardised lexical density (main regression variables):
-        lm_pos_density, lm_neg_density, lm_uncertain_density, lm_litigious_density,
-        lm_strongmodal_density, lm_weakmodal_density, lm_constrain_density
-    Net managerial sentiment: lm_net_sentiment = positive density minus negative density
-    Text volume control: comment_wordcount, comment_char_length, sentence_event_count
+──────────────────────────────────────────────────────────────────────────────
+12. REGULATORY VARIABLES — TWO MEASURES, PRIMARY vs SECONDARY
+──────────────────────────────────────────────────────────────────────────────
+  (A) PRIMARY — structured reg_* from 01b_deal_overview.csv
+      reg_body_count, reg_country_count
+      reg_antitrust, reg_securities, reg_state_assets, reg_foreign_invest,
+      reg_financial, reg_defense_tech
+      reg_cross_national, reg_common_law, reg_civil_law, reg_mixed_legal
+      Built from the `regulatory_body_name` field by enumerating all 443
+      distinct authority names and resolving each through a three-tier scheme
+      (exact map > exclude list > keyword fallback). Deal-level ORs across all
+      bodies on a deal; categories are NOT mutually exclusive.
+      reg_common_law / reg_civil_law / reg_mixed_legal rely on exact country-
+      name matching and are INTERMEDIATE — 04b overrides them with the
+      dedicated legal-origin dataset. Do not use for final inference.
 
-Processing Rules:
-    1. All ratio & size variables winsorised at 1% / 99% tails to mitigate outliers
-    2 Peer benchmark calculations require minimum 3 valid peer observations to avoid noisy medians
-    3 Log transformations applied only to strictly positive financial values; invalid entries set to NaN
-    4 All categorical legal / regulatory dummies coded as binary Int64 for Stata compatibility
-    5 Raw unstructured comment text discarded in prior merge script; only numerically derived sentiment features retained to reduce file bloat
-    6 Missing peer identifiers yield empty benchmark metrics (assigned NaN, not imputed)
+  (B) SECONDARY — text-derived, from 01c_comments_features.csv
+      num_unique_reg, reg_event_count, has_phase2_investigation
+      Counted by regex-scanning comment text. Coverage ~1.84% vs ~12.8% for
+      the structured measure, and the keyword list covers only Western
+      antitrust agencies with NO securities regulators — deals reviewed via
+      the securities route score 0 BY CONSTRUCTION.
+      ⇒ Robustness / alternative measure only. Never substitute for (A).
+
+13. M&A Advisor Count Aggregates (Module J = 03b_firm_advisor_count.csv)
+    tar_total_advisor, acq_total_advisor: Sum of advisor type dummies
+    num_tar_adv_* / num_acq_adv_* : per-type counts
+
+14. Information Disclosure Source Metrics (01_deal_info_source_count.csv)
+    total_info_source: Sum of per-channel disclosure dummies
+    Uses min_count=1 so a deal with no source record stays NaN rather than 0.
+
+15. Deal Comment Features (01c_comments_features.csv)
+    — merged here, not rebuilt; see 01c for construction detail.
+    Text volume control: comment_wordcount, log_comment_wordcount,
+        comment_char_length, sentence_event_count
+    LM word counts: lm_*_count (7 categories)
+    LM presence dummies (main specification): has_lm_* (7 categories,
+        NaN = no comment)
+    Comment availability: has_comment
+    Timeline / negotiation flags: total_timeline_days, has_rumour,
+        has_target_reject, has_unconditional_offer, has_deal_complete,
+        has_goshop, has_reg_remedy, has_debt_assumption
+    Premium / bidding: price_event_num, max_premium_pct, avg_premium_pct,
+        rival_bidder_num
+
+    NOT emitted by 01c (do not expect these columns):
+      lm_*_density          EMIT_LM_DENSITY = False. Median comment ~88 words
+                            and expected LM hits < 1 per category, so
+                            density = count/88 is not interpretable.
+      lm_net_sentiment      Never computed. LM (2011) positive vs negative word
+                            lists differ ~6.6x (354 vs 2355), so a net score is
+                            systematically negative; the authors advise against.
+      deal_complexity_score EMIT_COMPLEXITY = False, deprecated.
+
+PROCESSING RULES
+    1. Ratio & size variables winsorised at 1% / 99%.
+       Winsorised set = the 18 ratio/size columns in STEP 4
+                      + tar_total_advisor, acq_total_advisor
+                      + total_info_source
+                      + ind_text_diversity -> ind_text_diversity_w
+       The PEER CORPUS ratios get an extra pre-filter (denominator >= 100k)
+       before winsorising and standardising — see item 7.
+    2. Log transforms applied only to strictly positive values; else NaN.
+    3. Categorical institutional dummies stored as nullable Int64 for Stata.
+    4. Raw comment text was discarded upstream in 02; only numeric features
+       are carried through, to keep file size manageable.
+    5. Missing peer identifiers yield NaN benchmarks (never imputed).
 
 Author: Q  Date: 2026-04-15
-Updated: 2026-08-08: Add full L-M sentiment & negotiation complexity feature suite from Module F comment dataset
+Updated: 2026-08-08: add LM sentiment & negotiation feature suite from 01c
+Revised: 2026-09-06: docstring reconciled with code — duration cleaning
+         documented, legal_origin / classification_distance role suffixes
+         corrected, FinSimGap components added, MIN_PEERS gap flagged,
+         primary-vs-secondary regulatory measures separated, "balanced panel"
+         wording corrected.
 """
 
 import os
@@ -128,6 +262,10 @@ log = logging.getLogger("08b_var_construction")
 log.setLevel(logging.DEBUG)
 fmt = logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s",
                          datefmt="%Y-%m-%d %H:%M:%S")
+# 防止 %runfile 重复运行导致 handler 累积（每行打印 N 遍的根因）
+log.handlers.clear()
+log.propagate = False          # 同时阻断向 root logger 二次传播
+
 fh = logging.FileHandler(LOG_PATH, mode="w", encoding="utf-8")
 fh.setFormatter(fmt)
 ch = logging.StreamHandler(sys.stdout)
@@ -395,7 +533,8 @@ source_keywords = ["Stock_Exchange","Website","Company_Press_Release","Electroni
 src_dummy_cols = [c for c in df.columns if any(k in c for k in source_keywords) and c.startswith("num_")]
 all_source_dummies = src_dummy_cols
 
-df["total_info_source"] = df[src_dummy_cols].sum(axis=1)
+#df["total_info_source"] = df[src_dummy_cols].sum(axis=1)
+df["total_info_source"] = df[src_dummy_cols].sum(axis=1, min_count=1)
 
 log.info(f"  total_info_source: N={df['total_info_source'].notna().sum():,} "
          f"mean={df['total_info_source'].mean():.2f} median={df['total_info_source'].median():.1f}")
@@ -429,8 +568,25 @@ df["announced_date"]    = excel_serial_to_date(df["announced_d"])
 df["completed_date"]    = excel_serial_to_date(df["completed_d"])
 df["assumed_comp_date"] = excel_serial_to_date(df["assumed_comp_d"])
 
-# End date: completed_d → assumed_comp_d fallback
+# ── 剔除 Zephyr 的机械填充日期 ──
+# (1) 730 簇：completed_d 缺失时 assumed_comp_d = announced_d + 730（占位外推）
+_off  = (pd.to_numeric(df["assumed_comp_d"], errors="coerce")
+         - pd.to_numeric(df["announced_d"], errors="coerce"))
+_mech = _off.between(700, 760) & df["completed_date"].isna()
+log.info(f"  730天机械填充置缺失: {int(_mech.sum()):,} 行")
+df.loc[_mech, "assumed_comp_date"] = pd.NaT
+
+# (2) 零时长：announced_d 缺失被填成 completed_d
+_zero = (df["completed_date"].notna() & df["announced_date"].notna()
+         & (df["completed_date"] == df["announced_date"]))
+log.info(f"  零时长占位填充置缺失: {int(_zero.sum()):,} 行")
+df.loc[_zero, "completed_date"] = pd.NaT
+# ── 剔除 Zephyr 的机械填充日期 end──
+
+# End date: completed_d → assumed_comp_d fallback（用 _date，不是 _d）
 df["end_date"] = df["completed_date"].fillna(df["assumed_comp_date"])
+log.info(f"  end_date dtype: {df['end_date'].dtype}")
+
 
 # DaysToCompletion
 df["DaysToCompletion"] = (df["end_date"] - df["announced_date"]).dt.days
@@ -502,6 +658,25 @@ log.info(
     f"c_rev_growth: {corpus['c_rev_growth'].notna().sum():,}"
 )
 
+# ── P0 修复：比率变量先过滤小分母，再 winsorise，最后才标准化 ──
+# 原因：分母接近 0 时比率爆炸（实测 max=1,036,235），
+#       sigma 被拉到 15298 → z-score 全被除没 → FinSimGap 变噪音
+_MIN_DEN = 100          # 单位千，即 10 万；低于此视为分母不可靠
+_rev_den = pd.to_numeric(corpus["pre_deal_tar_rev_rev_last_avail_yr"], errors="coerce")
+_ta_den  = pd.to_numeric(corpus["pre_deal_tar_ta_last_avail_yr"], errors="coerce")
+_y1_den  = pd.to_numeric(corpus["tar_rev_rev_yr__1"], errors="coerce")
+
+corpus.loc[_rev_den < _MIN_DEN, "c_ebitda_margin"] = np.nan
+corpus.loc[_ta_den  < _MIN_DEN, "c_leverage"]      = np.nan
+corpus.loc[_y1_den  < _MIN_DEN, "c_rev_growth"]    = np.nan
+
+for _v in ["c_ebitda_margin", "c_leverage", "c_rev_growth"]:
+    _lo = corpus[_v].quantile(WINSOR_LO)
+    _hi = corpus[_v].quantile(WINSOR_HI)
+    corpus[_v] = corpus[_v].clip(_lo, _hi)
+    log.info(f"  [P0-fix] {_v}: mu={corpus[_v].mean():.4f}  "
+             f"sigma={corpus[_v].std():.4f}  N={corpus[_v].notna().sum():,}")
+    
 # --- 7.2 Standardise financial variables across full corpus ---
 log.info("  Standardising financial variables across full corpus ...")
 
@@ -1227,11 +1402,8 @@ COLS_TO_SAVE = [
     "ln_text_rev", "ln_text_ebitda", "ln_text_ebit",
     "ln_sic_rev",  "ln_sic_ebitda",  "ln_sic_ebit",
 
-
-
     # ── ind_text_diversity (Revised H2) ──────────────────────────────────────
     "ind_text_diversity", "ind_text_diversity_w",
-
 
     # ── DaysToCompletion (H5) ─────────────────────────────────────────────────
     "DaysToCompletion", "ln_days",
@@ -1242,12 +1414,29 @@ COLS_TO_SAVE = [
 
     # ── Deal-level controls (pre-existing from Script 05) ─────────────────────
     "cross_industry", "cross_industry_alt", "ln_deal_value", "cross_border",
-    "deal_pay_method",  # cashKeyError缺失，注释掉
+    #"deal_pay_method",  # cashKeyError缺失，注释掉
+    
+    # ── 支付方式（2026-09-07 新增，务必进入 Stata 导出）──
+    "deal_pay_method",            # 原始单值（保留向后兼容）
+    "deal_pay_method_all",        # 01a 去重前聚合的竖线分隔全集 ← 关键
+    "pay_method_count",
+    "pay_has_cash", "pay_has_shares", "pay_has_debt", "pay_has_other",
+    "pay_n_class",
+    "pay_pure_cash", "pay_pure_shares", "pay_pure_debt", "pay_pure_other",
+    "pay_mix", "pay_unknown",
+    "pay_mix_cash_shares", "pay_mix_with_shares",
+    "pay_mix_with_cash", "pay_mix_with_debt",
+    "pay_class",                  # 互斥类别标签（字符串，回归用）
+    # ── 支付方式（2026-09-07 新增，务必进入 Stata 导出）end──
+
+    # ── deal characteristics  ───────────────────────────────────
+    "deal_value","deal_status",
 
     # ── Target firm controls ──────────────────────────────────────────────────
     "ln_tar_size", "tar_ebitda_margin",
     "tar_leverage", "tar_rev_growth", "tar_roa",
     "tar_post_ebitda_margin", "tar_post_roa", "ln_tar_post_size", "tar_post_leverage",
+    
 
     # ── Acquirer controls ─────────────────────────────────────────────────────
     "ln_rel_size", "acq_roa",
@@ -1258,25 +1447,79 @@ COLS_TO_SAVE = [
     "national_class",
     "common_law_tar","common_law_acq",
 
-
-    # ── Raw target financials for Table 6 ─────────────────────────────────────
+    # ── Raw target financials ─────────────────────────────────────
     "tar_ta_for_t6", "tar_rev_for_t6",
     "tar_mktcap_for_t6", "tar_ev_for_t6", "tar_mb_for_t6",
-
-    # ── Target characteristics for Table 5 ───────────────────────────────────
-    "deal_value",
 
     # ── Listed-firm status (acquiror and target) ──────────────────────────────
     "tar_listed", "acq_listed",
 
-    # ── H3 mechanism: SIC classification distance ────────────────────────────
+    # ── SIC classification distance ────────────────────────────
     "sic_coverage_rate","acq_tar_similarity",
-    "classification_distance_tar","classification_distance_acq"
-    
+    "classification_distance_tar","classification_distance_acq" 
 ]
 
-# 下面这一行保持原样不动
+# ── 兼容处理：剔除已弃用列，补充 01c 新列 ──
+_DEPRECATED_COLS = [
+    "deal_complexity_score",
+    "lm_pos_density", "lm_neg_density", "lm_uncertain_density",
+    "lm_litigious_density", "lm_strongmodal_density",
+    "lm_weakmodal_density", "lm_constrain_density",
+    "lm_net_sentiment",
+]
+
+# 新增：comment 可得性哑变量（区分「无 comment」vs「有 comment 但无该类词」）
+if "has_lm_litigious" in df.columns:
+    df["has_comment"] = df["has_lm_litigious"].notna().astype("Int64")
+    log.info(f"  has_comment: {df['has_comment'].sum():,} / {len(df):,} "
+             f"({100*df['has_comment'].mean():.1f}%)")
+
+_NEW_TEXT_COLS = [
+    # 文本长度控制
+    "comment_wordcount", "log_comment_wordcount", "comment_char_length",
+    "sentence_event_count",
+    # LM 计数
+    "lm_pos_count", "lm_neg_count", "lm_uncertain_count", "lm_litigious_count",
+    "lm_strongmodal_count", "lm_weakmodal_count", "lm_constrain_count",
+    # LM 二值 presence
+    "has_lm_pos", "has_lm_neg", "has_lm_uncertain", "has_lm_litigious",
+    "has_lm_strongmodal", "has_lm_weakmodal", "has_lm_constrain",
+    # 可得性
+    "has_comment",
+]
+
+COLS_TO_SAVE = [c for c in COLS_TO_SAVE if c not in _DEPRECATED_COLS]
+COLS_TO_SAVE = COLS_TO_SAVE + [c for c in _NEW_TEXT_COLS
+                               if c in df.columns and c not in COLS_TO_SAVE]
+# ── 补齐 STEP 4 新增财务比率（原 COLS_TO_SAVE 硬编码名单未同步）──
+_RATIO_COLS = [
+    # Pre Target
+    "tar_ebitda_margin", "tar_leverage", "tar_rev_growth", "tar_roa", "ln_tar_size",
+    # Pre Acquirer（2026 新增，此前被漏掉）
+    "acq_ebitda_margin", "acq_leverage", "acq_roa", "ln_acq_size", "ln_rel_size",
+    # Post Target
+    "tar_post_ebitda_margin", "tar_post_roa", "ln_tar_post_size", "tar_post_leverage",
+    # Post Acquirer（2026 新增，此前被漏掉）
+    "acq_post_ebitda_margin", "acq_post_roa", "ln_acq_post_size", "acq_post_leverage",
+    # 交易结构
+    "stake_acq_pct", "stake_final_pct",
+]
+COLS_TO_SAVE = COLS_TO_SAVE + [c for c in _RATIO_COLS
+                               if c in df.columns and c not in COLS_TO_SAVE]
+
+# ── 审计：打印 df 里有但名单外的列，防止下次再漏 ──
+_orphan = [c for c in df.columns if c not in COLS_TO_SAVE]
+log.info(f"  未纳入导出的列（{len(_orphan)} 个，确认是否故意排除）: {_orphan[:60]}")
+
+# 兜底：任何不在 df 里的列一律剔除，避免再次 KeyError
+#_missing_cols = [c for c in COLS_TO_SAVE if c not in df.columns]
+#if _missing_cols:
+    #log.warning(f"  COLS_TO_SAVE 中以下列不存在，已剔除: {_missing_cols}")
+#COLS_TO_SAVE = [c for c in COLS_TO_SAVE if c in df.columns]
+
+log.info(f"  最终导出列数: {len(COLS_TO_SAVE)}")
 df_save = df[COLS_TO_SAVE].copy()
+
 
 # Rename _row_id → row_id (Stata rejects variable names starting with '_')
 if "_row_id" in df_save.columns:
