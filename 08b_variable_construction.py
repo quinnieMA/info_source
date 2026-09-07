@@ -2,7 +2,7 @@
 """
 08b_variable_construction.py
 Date: 2026-04-15
-Last Updated: 2026-09-06
+Last Updated: 2026-09-07
 Purpose: Construct all regression-ready firm, transaction, textual sentiment and
 regulatory variables; export the analysis dataset to Stata .dta format.
 
@@ -1419,7 +1419,9 @@ COLS_TO_SAVE = [
     # ── 支付方式（2026-09-07 新增，务必进入 Stata 导出）──
     "deal_pay_method",            # 原始单值（保留向后兼容）
     "deal_pay_method_all",        # 01a 去重前聚合的竖线分隔全集 ← 关键
-    "pay_method_count",
+    #"pay_method_count",
+    "deal_pay_method_n",          # 改了名
+    
     "pay_has_cash", "pay_has_shares", "pay_has_debt", "pay_has_other",
     "pay_n_class",
     "pay_pure_cash", "pay_pure_shares", "pay_pure_debt", "pay_pure_other",
@@ -1428,6 +1430,11 @@ COLS_TO_SAVE = [
     "pay_mix_with_cash", "pay_mix_with_debt",
     "pay_class",                  # 互斥类别标签（字符串，回归用）
     # ── 支付方式（2026-09-07 新增，务必进入 Stata 导出）end──
+    # ── structure（2026-09-07 新增，务必进入 Stata 导出）──   
+    "deal_struct_all", "deal_struct_n",
+    "deal_fin_all",    "deal_fin_n",
+    "deal_type_all",   "deal_type_n",
+    # ── structure（2026-09-07 新增，务必进入 Stata 导出）end──
 
     # ── deal characteristics  ───────────────────────────────────
     "deal_value","deal_status",
