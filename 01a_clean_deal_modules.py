@@ -23,6 +23,10 @@ Module B (Valuation Multiples) → data/cleaned/01_deal_multiples.csv
     Unit: Single row per deal, pre/post transaction multiples
 Module C (Deal Structure & Dates) → data/cleaned/01_deal_structure_date.csv
     Unit: Single row per deal, transaction status & time horizon variables
+    - 2026-09-07: Module C — aggregate deal_pay_method to a pipe-joined set BEFORE
+  dedup (Zephyr stores one method per row; keep-first dedup silently dropped
+  share-based consideration on mixed Cash+Shares deals)
+  
 Module D (Transaction Value & Stake) → data/cleaned/01_deal_value.csv
     Unit: Single row per deal, equity/EV consideration & acquired ownership share
 Module F (Information Source Categories) → data/cleaned/01_deal_info_source_count.csv
@@ -344,6 +348,49 @@ df_sd = df_sd[df_sd["deal_num"].notna()].copy()
 if n_before > len(df_sd):
     print(f"Dropped {n_before - len(df_sd):,} rows with NaN deal_num")
 
+# ══ PAY METHOD AGGREGATION (2026-09-07) ═══════════════════════════════════
+# Zephyr 一条支付方式占一行：Cash + Shares 的混合交易占两行。
+# 下面 Module C 按 deal_num 去重（keep first），会静默丢掉第二行，
+# 导致换股对价被系统性低估——而换股正是触发证券审查的那一组。
+# 故在 dedup 之前先聚合为竖线分隔集合，去重后再 merge 回来。
+# 只新增列，不改动原有 deal_pay_method，下游旧脚本不受影响。
+if "deal_pay_method" in df_sd.columns:
+    pay_agg = (
+        df_sd.dropna(subset=["deal_pay_method"])
+             .groupby("deal_num")["deal_pay_method"]
+             .apply(lambda x: "|".join(sorted(set(x.astype(str)))))
+             .rename("deal_pay_method_all")
+             .to_frame()
+    )
+    pay_agg["pay_method_count"] = (
+        pay_agg["deal_pay_method_all"].str.split("|").apply(len)
+    )
+    pay_agg = pay_agg.reset_index()
+
+    _n_multi = int((pay_agg["pay_method_count"] > 1).sum())
+    print(f"\nPAY AGG: {len(pay_agg):,} deals 有支付方式 | "
+          f"{_n_multi:,} 笔 ({_n_multi/max(len(pay_agg),1):.1%}) 使用多种支付方式")
+
+    # ── 关键诊断：去重到底丢了多少换股交易 ──
+    _first_pay = (df_sd.dropna(subset=["deal_pay_method"])
+                       .drop_duplicates(subset=["deal_num"], keep="first")
+                       .set_index("deal_num")["deal_pay_method"].astype(str))
+    _cmp = pay_agg.set_index("deal_num")["deal_pay_method_all"].to_frame() \
+                  .join(_first_pay.rename("first_pay"), how="left")
+    _has_sh = _cmp["deal_pay_method_all"].str.contains("Shares", na=False)
+    _lost   = int((_has_sh & (_cmp["first_pay"] != "Shares")).sum())
+    print(f"  ⚠️ {_lost:,} 笔交易含换股，但去重后首行不是 Shares → 换股信息被丢弃")
+    print(f"     去重口径 Shares 占比 {_cmp['first_pay'].eq('Shares').mean():.1%}"
+          f"  →  聚合口径含 Shares 占比 {_has_sh.mean():.1%}")
+
+    print("  Top 12 聚合组合:")
+    for _v, _n in pay_agg["deal_pay_method_all"].value_counts().head(12).items():
+        print(f"    {str(_v):<52s} {_n:>7,}")
+else:
+    pay_agg = None
+    print("\nPAY AGG: 跳过（无 deal_pay_method 列）")
+# ══ PAY METHOD AGGREGATION (2026-09-07) end═══════════════════════════════════
+   
 # F2 FIXER R1: verify duplicate rows in Module C are genuinely identical
 _dup_mask_c = df_sd.duplicated(subset=["deal_num"], keep=False)
 if _dup_mask_c.sum() > 0:
@@ -366,16 +413,39 @@ print(f"After dedup by deal_num: {len(df_sd):,} rows "
       f"(dropped {n_before_dedup - len(df_sd):,} duplicate rows)")
 
 # Convert deal_num to Int64
+#df_sd["deal_num"] = pd.to_numeric(df_sd["deal_num"], errors="coerce").astype("Int64")
+
+# Select key columns for analysis
+#SD_KEEP = [
+   # "deal_num",
+    #"deal_type", "deal_status", "deal_struct", "deal_fin", "deal_pay_method",
+   # "announced_d", "completed_d", "withdrawn_d",
+   # "announced_d_yr", "completed_d_yr", "withdrawn_d_yr",
+    #"assumed_comp_d",   # needed by Script 08 DaysToCompletion (fallback end date)
+#]
+# Convert deal_num to Int64
+
 df_sd["deal_num"] = pd.to_numeric(df_sd["deal_num"], errors="coerce").astype("Int64")
+
+# ── 把去重前聚合的支付方式 merge 回来 ──
+if pay_agg is not None:
+    pay_agg["deal_num"] = pd.to_numeric(pay_agg["deal_num"], errors="coerce").astype("Int64")
+    df_sd = df_sd.merge(pay_agg, on="deal_num", how="left")
+    _mp = int(df_sd["deal_pay_method_all"].isna().sum())
+    print(f"  PAY AGG merged: {len(df_sd)-_mp:,}/{len(df_sd):,} deals 有值 | "
+          f"缺失 {_mp:,} ({_mp/len(df_sd):.1%})")
 
 # Select key columns for analysis
 SD_KEEP = [
     "deal_num",
     "deal_type", "deal_status", "deal_struct", "deal_fin", "deal_pay_method",
+    "deal_pay_method_all",      # ← 新增：去重前聚合的全部支付方式（竖线分隔）
+    "pay_method_count",         # ← 新增：支付方式种类数
     "announced_d", "completed_d", "withdrawn_d",
     "announced_d_yr", "completed_d_yr", "withdrawn_d_yr",
     "assumed_comp_d",   # needed by Script 08 DaysToCompletion (fallback end date)
 ]
+
 SD_KEEP_PRESENT = [c for c in SD_KEEP if c in df_sd.columns]
 df_sd = df_sd[SD_KEEP_PRESENT].copy()
 
