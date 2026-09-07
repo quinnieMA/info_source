@@ -23,9 +23,10 @@ Module B (Valuation Multiples) → data/cleaned/01_deal_multiples.csv
     Unit: Single row per deal, pre/post transaction multiples
 Module C (Deal Structure & Dates) → data/cleaned/01_deal_structure_date.csv
     Unit: Single row per deal, transaction status & time horizon variables
-    - 2026-09-07: Module C — aggregate deal_pay_method to a pipe-joined set BEFORE
-  dedup (Zephyr stores one method per row; keep-first dedup silently dropped
-  share-based consideration on mixed Cash+Shares deals)
+- 2026-09-07: Module C — generalize categorical aggregation to all multi-value
+  fields (pay_method / struct / fin / type) BEFORE dedup. deal_struct has
+  6,435 multi-value deals (vs 1,735 for pay_method) — dedup was dropping ~1/3
+  of structure tags.
   
 Module D (Transaction Value & Stake) → data/cleaned/01_deal_value.csv
     Unit: Single row per deal, equity/EV consideration & acquired ownership share
@@ -348,48 +349,113 @@ df_sd = df_sd[df_sd["deal_num"].notna()].copy()
 if n_before > len(df_sd):
     print(f"Dropped {n_before - len(df_sd):,} rows with NaN deal_num")
 
-# ══ PAY METHOD AGGREGATION (2026-09-07) ═══════════════════════════════════
-# Zephyr 一条支付方式占一行：Cash + Shares 的混合交易占两行。
-# 下面 Module C 按 deal_num 去重（keep first），会静默丢掉第二行，
-# 导致换股对价被系统性低估——而换股正是触发证券审查的那一组。
-# 故在 dedup 之前先聚合为竖线分隔集合，去重后再 merge 回来。
-# 只新增列，不改动原有 deal_pay_method，下游旧脚本不受影响。
-if "deal_pay_method" in df_sd.columns:
-    pay_agg = (
-        df_sd.dropna(subset=["deal_pay_method"])
-             .groupby("deal_num")["deal_pay_method"]
-             .apply(lambda x: "|".join(sorted(set(x.astype(str)))))
-             .rename("deal_pay_method_all")
-             .to_frame()
-    )
-    pay_agg["pay_method_count"] = (
-        pay_agg["deal_pay_method_all"].str.split("|").apply(len)
-    )
-    pay_agg = pay_agg.reset_index()
+# ══ CATEGORICAL FIELD AGGREGATION (2026-09-08) ═══════════════════════════
+# Zephyr 对多值分类字段采用「一值一行」存储。Module C 按 deal_num keep-first
+# 去重会静默丢弃第二行起的取值。
+#
+# 实测损失：
+#   deal_pay_method : 多值 deal 1,735 | 换股占比被低估 13.4% → 18.6%
+#   deal_struct     : 多值 deal 6,435 | 每 deal 均值 1.49 个取值 ← 更严重
+#
+# 故所有分类字段统一在 dedup 之前聚合为竖线分隔集合。
+# 新增字段：只需在下面列表里加一个字符串，不要再写特化代码。
+CATEGORICAL_AGG = [
+    "deal_pay_method",
+    "deal_struct",
+    "deal_fin",
+    "deal_type",
+]
 
-    _n_multi = int((pay_agg["pay_method_count"] > 1).sum())
-    print(f"\nPAY AGG: {len(pay_agg):,} deals 有支付方式 | "
-          f"{_n_multi:,} 笔 ({_n_multi/max(len(pay_agg),1):.1%}) 使用多种支付方式")
+# ⚠️ 后处理/特殊情境取值 —— 聚合后仅标记，禁止进入任何回归
+STRUCT_POSTTREAT = {
+    "Public takeover - Unsuccessful",
+    "Public takeover - Withdrawn",
+}
+STRUCT_DISTRESS = {
+    "Receivership", "Insolvency", "Administration",
+    "Nationalisation", "Distressed Debt",
+}
 
-    # ── 关键诊断：去重到底丢了多少换股交易 ──
-    _first_pay = (df_sd.dropna(subset=["deal_pay_method"])
-                       .drop_duplicates(subset=["deal_num"], keep="first")
-                       .set_index("deal_num")["deal_pay_method"].astype(str))
-    _cmp = pay_agg.set_index("deal_num")["deal_pay_method_all"].to_frame() \
-                  .join(_first_pay.rename("first_pay"), how="left")
-    _has_sh = _cmp["deal_pay_method_all"].str.contains("Shares", na=False)
-    _lost   = int((_has_sh & (_cmp["first_pay"] != "Shares")).sum())
-    print(f"  ⚠️ {_lost:,} 笔交易含换股，但去重后首行不是 Shares → 换股信息被丢弃")
-    print(f"     去重口径 Shares 占比 {_cmp['first_pay'].eq('Shares').mean():.1%}"
-          f"  →  聚合口径含 Shares 占比 {_has_sh.mean():.1%}")
+_agg_frames = []
+print("\n" + "=" * 70)
+print("CATEGORICAL AGG — 分类字段去重前聚合")
+print("=" * 70)
 
-    print("  Top 12 聚合组合:")
-    for _v, _n in pay_agg["deal_pay_method_all"].value_counts().head(12).items():
-        print(f"    {str(_v):<52s} {_n:>7,}")
+for _src in CATEGORICAL_AGG:
+    if _src not in df_sd.columns:
+        print(f"  {_src:<20s} 跳过（不在数据中）")
+        continue
+
+    _sub = df_sd.dropna(subset=[_src])
+    if _sub.empty:
+        print(f"  {_src:<20s} 跳过（全缺失）")
+        continue
+
+    _out = f"{_src}_all"
+    _cnt = f"{_src}_n"
+    _g = (_sub.groupby("deal_num")[_src]
+          .apply(lambda x: "|".join(sorted(set(x.astype(str)))))
+          .rename(_out).to_frame())
+    _g[_cnt] = _g[_out].str.split("|").apply(len)
+    _g = _g.reset_index()
+
+    _n_deal = len(_g)
+    _n_multi = int((_g[_cnt] > 1).sum())
+    print(f"\n  【{_src}】{_n_deal:,} deals 有值 | "
+          f"多值 deal {_n_multi:,} ({_n_multi/max(_n_deal,1):.1%}) | "
+          f"每 deal 均值 {_g[_cnt].mean():.2f}")
+
+    _agg_frames.append(_g)
+
+    # ── deal_pay_method：保留换股低估诊断 ──
+    if _src == "deal_pay_method":
+        _first = (_sub.drop_duplicates("deal_num", keep="first")
+                  .set_index("deal_num")[_src].astype(str))
+        _cmp = _g.set_index("deal_num")[[_out]].join(
+            _first.rename("_first"), how="left")
+        _has = _cmp[_out].str.contains("Shares", na=False)
+        _lost = int((_has & (_cmp["_first"] != "Shares")).sum())
+        print(f"     ⚠️ {_lost:,} 笔含换股但去重首行非 Shares → 信息被丢弃")
+        print(f"        去重口径 {_cmp['_first'].eq('Shares').mean():.1%}"
+              f"  →  聚合口径 {_has.mean():.1%}")
+
+    # ── deal_struct：输出全取值域（供分类映射用）──
+    if _src == "deal_struct":
+        _vals = _sub[_src].astype(str).value_counts()
+        print(f"\n     [取值域] {len(_vals)} 个取值，全部列出：")
+        for _v, _n in _vals.items():
+            _flag = ""
+            if _v in STRUCT_POSTTREAT:
+                _flag = "  ⚠️后处理-禁入回归"
+            elif _v in STRUCT_DISTRESS:
+                _flag = "  ⚠️破产/接管-建议剔样本"
+            print(f"       {_v:<44s} {_n:>7,}{_flag}")
+
+        print(f"\n     [聚合后组合] Top 15：")
+        for _v, _n in _g[_out].value_counts().head(15).items():
+            print(f"       {str(_v):<60s} {_n:>7,}")
+
+        # 后处理 / 困境类规模
+        for _lab, _set in [("后处理", STRUCT_POSTTREAT),
+                           ("困境情境", STRUCT_DISTRESS)]:
+            _m = _g[_out].apply(
+                lambda s: bool({x.strip() for x in str(s).split("|")} & _set))
+            print(f"     含【{_lab}】标记的 deal: {int(_m.sum()):,} "
+                  f"({_m.mean():.1%})")
+
+# ── 合并所有聚合结果 ──
+if _agg_frames:
+    _agg_all = _agg_frames[0]
+    for _f in _agg_frames[1:]:
+        _agg_all = _agg_all.merge(_f, on="deal_num", how="outer")
+    _agg_all["deal_num"] = pd.to_numeric(
+        _agg_all["deal_num"], errors="coerce").astype("Int64")
+    print(f"\n  聚合表就绪：{len(_agg_all):,} deals | "
+          f"{len(_agg_all.columns)-1} 个新列")
 else:
-    pay_agg = None
-    print("\nPAY AGG: 跳过（无 deal_pay_method 列）")
-# ══ PAY METHOD AGGREGATION (2026-09-07) end═══════════════════════════════════
+    _agg_all = None
+    print("\n  ⚠️ 没有任何字段被聚合")
+# ══ CATEGORICAL AGGREGATION end ═══════════════════════════════════════════
    
 # F2 FIXER R1: verify duplicate rows in Module C are genuinely identical
 _dup_mask_c = df_sd.duplicated(subset=["deal_num"], keep=False)
@@ -427,25 +493,30 @@ print(f"After dedup by deal_num: {len(df_sd):,} rows "
 
 df_sd["deal_num"] = pd.to_numeric(df_sd["deal_num"], errors="coerce").astype("Int64")
 
-# ── 把去重前聚合的支付方式 merge 回来 ──
-if pay_agg is not None:
-    pay_agg["deal_num"] = pd.to_numeric(pay_agg["deal_num"], errors="coerce").astype("Int64")
-    df_sd = df_sd.merge(pay_agg, on="deal_num", how="left")
+# ── 把去重前聚合的分类字段 merge 回来 end 260907──
+if _agg_all is not None:
+    df_sd = df_sd.merge(_agg_all, on="deal_num", how="left")
     _mp = int(df_sd["deal_pay_method_all"].isna().sum())
-    print(f"  PAY AGG merged: {len(df_sd)-_mp:,}/{len(df_sd):,} deals 有值 | "
+    print(f"  CATEGORICAL AGG merged: {len(df_sd)-_mp:,}/{len(df_sd):,} deals 有支付方式 | "
           f"缺失 {_mp:,} ({_mp/len(df_sd):.1%})")
-
+    for _c in [c for c in df_sd.columns if c.endswith("_all")]:
+        print(f"    {_c:<28s} 覆盖 {df_sd[_c].notna().mean():.1%}")
+# ── 把去重前聚合的分类字段 merge 回来 end 260907──
+        
+        
 # Select key columns for analysis
 SD_KEEP = [
     "deal_num",
     "deal_type", "deal_status", "deal_struct", "deal_fin", "deal_pay_method",
-    "deal_pay_method_all",      # ← 新增：去重前聚合的全部支付方式（竖线分隔）
-    "pay_method_count",         # ← 新增：支付方式种类数
+    # ── 去重前聚合的分类字段（2026-09-08）──
+    "deal_pay_method_all", "deal_pay_method_n",
+    "deal_struct_all",     "deal_struct_n",
+    "deal_fin_all",        "deal_fin_n",
+    "deal_type_all",       "deal_type_n",
     "announced_d", "completed_d", "withdrawn_d",
     "announced_d_yr", "completed_d_yr", "withdrawn_d_yr",
-    "assumed_comp_d",   # needed by Script 08 DaysToCompletion (fallback end date)
+    "assumed_comp_d",
 ]
-
 SD_KEEP_PRESENT = [c for c in SD_KEEP if c in df_sd.columns]
 df_sd = df_sd[SD_KEEP_PRESENT].copy()
 
