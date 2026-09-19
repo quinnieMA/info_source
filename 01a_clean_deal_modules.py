@@ -1,105 +1,61 @@
-"""
+# -*- coding: utf-8 -*-
+r"""
 01a_clean_deal_modules.py
 ========================
-Batch clean raw Zephyr M&A source files into standardized module CSV files stored under data/cleaned.
-All raw data resides in subfolders of raw/MA_deal, processed sequentially by module.
-
-Core processing rules for every batch file:
-1. Preserve original row order strictly; forward-fill deal_num per file BEFORE concatenation.
-   Zephyr attaches supplementary cascade entity rows right after parent deal records. Sorting breaks
-   cascade row grouping and invalidates forward-fill recovery logic.
-2. Standardize missing value representations (Zephyr placeholder strings → uniform NaN).
-3. Normalize Orbis ID format to consistent 9-digit zero-padded string for cross-table matching.
-4. Recover acquirer SIC codes from within the same deal_num cascade block if unambiguous.
-5. Deduplication logic varies by module observation unit:
-   - Module A (Industry): Unique key = (deal_num, tar_key), tar_key = tar_bvd_id_num / tar_name fallback
-   - Module B/C/D (Multiples / Structure / Value): Unique key = deal_num (single record per transaction)
-   - Module F (Info Source): Aggregate source category counts to deal-level from multi-line raw records
-
-Module Output Mapping:
-Module A (Industry & Firm Text) → data/cleaned/01_deal_sic_industry.csv
-    Unit: Deal × Target (supports multi-target transactions; retains tar_overview Doc2Vec text)
-Module B (Valuation Multiples) → data/cleaned/01_deal_multiples.csv
-    Unit: Single row per deal, pre/post transaction multiples
-Module C (Deal Structure & Dates) → data/cleaned/01_deal_structure_date.csv
-    Unit: Single row per deal, transaction status & time horizon variables
-- 2026-09-07: Module C — generalize categorical aggregation to all multi-value
-  fields (pay_method / struct / fin / type) BEFORE dedup. deal_struct has
-  6,435 multi-value deals (vs 1,735 for pay_method) — dedup was dropping ~1/3
-  of structure tags.
-  
-Module D (Transaction Value & Stake) → data/cleaned/01_deal_value.csv
-    Unit: Single row per deal, equity/EV consideration & acquired ownership share
-Module F (Information Source Categories) → data/cleaned/01_deal_info_source_count.csv
-    Unit: Single row per deal, dummy count variables for each disclosure channel
-
-Revision Log:
-- 2026-07-27: Rewrite clean_missing() for cross-Pandas version compatibility
-Author: Q  Date: 2026-08-05
+2026-09-17:
+  [0] 2026-09-18: Vendor identity (Module vendorNER, G-0..G-5) is SUPERSEDED
+      by 01d_vendor_identity.py (v4: NER cache + graceful no-Java fallback).
+      Module kept here for run_all compatibility; 01d re-writes the same
+      output files (01_deal_vendor_type.csv, 01_deal_vendor_type_profile.csv).
+  [1] Entity identification switched to Stanford CoreNLP (mirrors the user's
+      existing pipeline)
+      - JAVA: C:\Program Files\Java\jdk1.8.0_202\bin
+      - CoreNLP: D:/OneDrive/NLP/stanford-corenlp-4.5.7
+      - import / start failure => raise; do NOT silently fall back to
+        hand-written rules
+  [2] Discriminator words live in an EXTERNAL CSV: data/vendor_lexicon.csv
+      - default version generated on first run; hand-editable, git-versioned
+      - classification priority lives in code (reproducible); the words live
+        in the CSV (auditable)
+  [3] Placeholders become explicit classes (no more "other"):
+      SHAREHOLDER -> shareholders_undisclosed (unnamed shareholders, worst
+                      information environment)
+      RECEIVER    -> insolvency (bankruptcy receivership)
+      MANAGEMENT  -> management
+  [4] Unclassifiable names => UNMAPPED; a frequency list is written out,
+      never silently accepted
 """
-
 import os
 import glob
+import re
+import warnings
 import pandas as pd
 import numpy as np
-
-# ── Paths ──────────────────────────────────────────────────────────────────
+warnings.filterwarnings("ignore")
 BASE      = r"D:\MA"
 RAW_DEAL  = os.path.join(BASE, "raw", "MA_deal")
 CLEANED   = os.path.join(BASE, "data", "cleaned")
 os.makedirs(CLEANED, exist_ok=True)
-
-# Placeholder strings Zephyr uses for missing values
 MISSING_VALS = ["-", "n.a.", "n.s.", "NA", "N/A", "nan", ""]
-
 def read_and_ffill(filepath, encoding="utf-8-sig"):
-    """
-    Read a Zephyr CSV in file order and immediately forward-fill deal_num.
-    Never sort before ffill — cascade rows have blank unnamed_0 too.
-    """
     df = pd.read_csv(filepath, encoding=encoding, low_memory=False)
-    # Normalise the BOM-prefixed unnamed column (appears as 'unnamed__0' or 'unnamed_0')
     df.columns = df.columns.str.strip()
-    # forward-fill deal_num in place (file order = Zephyr order)
     df["deal_num"] = df["deal_num"].ffill()
     return df
-
-#def clean_missing(df):
-    """Replace Zephyr placeholder strings with NaN across all object columns."""
-    # m1 FIXER R1: added .str.strip() to match script 03 behaviour
-    for col in df.select_dtypes(include=["object", "str"]).columns:
-        df[col] = df[col].replace(MISSING_VALS, np.nan).str.strip()
-    return df
 def clean_missing(df):
-    """Replace Zephyr placeholder strings with NaN across all object columns."""
-    # 兼容 pandas 3.x: 只使用 "object"，因为 pandas 3.x 不支持 "str"
     try:
-        # 尝试原作者的写法（pandas 2.x）
         cols = df.select_dtypes(include=["object", "str"]).columns
     except TypeError:
-        # pandas 3.x: 只使用 "object"
         cols = df.select_dtypes(include=["object"]).columns
-    
     for col in cols:
-        # 安全地处理字符串列
-        df[col] = df[col].astype('object')
+        df[col] = df[col].astype("object")
         df[col] = df[col].replace(MISSING_VALS, np.nan)
-        # 只对非空值进行 strip
         mask = df[col].notna()
         if mask.any():
             df.loc[mask, col] = df.loc[mask, col].astype(str).str.strip()
-            # 空字符串转 NaN
-            df.loc[mask, col] = df.loc[mask, col].replace('', np.nan)
+            df.loc[mask, col] = df.loc[mask, col].replace("", np.nan)
     return df
-
-
 def normalize_orbis_id(series):
-    """
-    Normalise Orbis ID to 9-digit zero-padded string.
-    pandas reads purely-numeric columns as float (e.g. 6533168.0);
-    this strips the trailing '.0' and zero-pads to match the format
-    used in the firm-module files (e.g. '006533168').
-    """
     def fix(val):
         if pd.isna(val):
             return np.nan
@@ -110,689 +66,611 @@ def normalize_orbis_id(series):
             return np.nan
         return s.zfill(9)
     return series.apply(fix)
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Module A — Industry + Text
-#   Source : raw/MA_deal/industry/  (5 batches, ~94,322 raw rows)
-#   Output : data/cleaned/01_deal_sic_industry.csv
-#   Unit   : (deal_num, tar_key) where tar_key = tar_bvd_id_num or tar_name
-# ════════════════════════════════════════════════════════════════════════════
-print("=" * 60)
-print("MODULE A — Industry + Text")
-print("=" * 60)
-
+# ══ Module 01a.import ═══════════════════════════════════════════════════════
+print("=" * 70); print("MODULE 01a.import — Industry + Text"); print("=" * 70)
 industry_dir = os.path.join(RAW_DEAL, "industry")
 industry_files = sorted(glob.glob(os.path.join(industry_dir, "acquisition_industry_*_cleaned.csv")))
 print(f"Found {len(industry_files)} industry batch files")
-
-# Columns to retain in the final cleaned file
 INDUSTRY_KEEP = [
-    "deal_num",
-    # Target identifiers
-    "tar_name", "tar_bvd_id_num", "tar_orbis_id_num",
-    # Target text (for Doc2Vec)
+    "deal_num", "tar_name", "tar_bvd_id_num", "tar_orbis_id_num",
     "tar_overview", "tar_trade_descr_en", "tar_busi_descr",
-    # Acquirer and vendor overview text (for Doc2Vec similarity measures)
     "acq_overview", "ven_overview",
-    # Target SIC and NAICS
-    "tar_primary_sic_code", "tar_sic_codes",
-    "tar_primary_naics_code",
-    # Acquirer identifiers + SIC (for CrossInd)
+    "tar_primary_sic_code", "tar_sic_codes", "tar_primary_naics_code",
     "acq_name", "acq_bvd_id_num", "acq_orbis_id_num",
     "acq_primary_sic_code", "acq_sic_codes",
-    # Vendor identifiers (for completeness)
-    "ven_name", "ven_bvd_id_num",
-    "ven_primary_sic_code",
+    "ven_name", "ven_bvd_id_num", "ven_primary_sic_code",
 ]
-
 batches_ind = []
 for fp in industry_files:
-    batch_name = os.path.basename(fp)
-    df_b = read_and_ffill(fp)
-    n_raw = len(df_b)
-    # Clean missing strings
+    df_b = read_and_ffill(fp); n_raw = len(df_b)
     df_b = clean_missing(df_b)
-    # Keep only columns present in INDUSTRY_KEEP
-    keep_present = [c for c in INDUSTRY_KEEP if c in df_b.columns]
-    df_b = df_b[keep_present]
+    df_b = df_b[[c for c in INDUSTRY_KEEP if c in df_b.columns]]
     batches_ind.append(df_b)
-    print(f"  {batch_name}: {n_raw} rows read, deal_num ffilled")
-
+    print(f"  {os.path.basename(fp)}: {n_raw} rows read")
 df_ind = pd.concat(batches_ind, ignore_index=True)
-print(f"\nAfter stacking all batches: {len(df_ind):,} rows")
-
-# Normalise Orbis IDs to 9-digit zero-padded strings
+print(f"\nAfter stacking: {len(df_ind):,} rows")
 for _oc in ["tar_orbis_id_num", "acq_orbis_id_num"]:
     if _oc in df_ind.columns:
         df_ind[_oc] = normalize_orbis_id(df_ind[_oc])
-
-# ── Recover acq_primary_sic_code from cascade rows (same deal_num block) ────
-# Zephyr splits target and acquirer info across different rows within one
-# deal_num (unlike the overview file, where cascade rows are fully blank).
-# The row kept below (tar_name notna) often has acq_primary_sic_code=NaN
-# while a sibling cascade row (tar_name NaN) for the same deal_num carries it.
-# Only fill when the whole deal_num block has EXACTLY ONE distinct non-null
-# acq_primary_sic_code value — never guess between competing bidders/targets.
+# ══ Module 01a.vendorname ═══════════════════════════════════════════════════
+# ── VENDOR AGG (must run BEFORE the tar_name filter) ────────────────────────────────────────────
+VENDOR_AGG = ["ven_name", "ven_bvd_id_num", "ven_primary_sic_code"]
+print("\n" + "=" * 70)
+print("VENDOR AGG — vendor-name aggregation before dedup")
+print("=" * 70)
+_ven_frames = []
+for _vc in VENDOR_AGG:
+    if _vc not in df_ind.columns:
+        print(f"  {_vc:<24s} skipped"); continue
+    _s = df_ind.dropna(subset=[_vc])
+    if _s.empty:
+        print(f"  {_vc:<24s} all missing"); continue
+    _g = (_s.groupby("deal_num")[_vc]
+          .apply(lambda x: "|".join(sorted(set(
+              str(v).strip() for v in x
+              if str(v).strip() and str(v).strip().lower() != "nan"))))
+          .rename(_vc + "_all").to_frame())
+    _g[_vc + "_n"] = _g[_vc + "_all"].apply(
+        lambda s: len([x for x in str(s).split("|") if x]) if pd.notna(s) else 0)
+    _g = _g.reset_index()
+    _n_multi = int((_g[_vc + "_n"] > 1).sum())
+    print(f"  {_vc:<24s} {len(_g):,} deals | multi {_n_multi:,} "
+          f"| mean {_g[_vc+'_n'].mean():.2f}")
+    _ven_frames.append(_g)
+_ven_agg = None
+if _ven_frames:
+    _ven_agg = _ven_frames[0]
+    for _f in _ven_frames[1:]:
+        _ven_agg = _ven_agg.merge(_f, on="deal_num", how="outer")
+    _ven_agg["deal_num"] = pd.to_numeric(_ven_agg["deal_num"], errors="coerce").astype("Int64")
+    _out_ven = os.path.join(CLEANED, "01_deal_vendor_name.csv")
+    _ven_agg.to_csv(_out_ven, index=False, encoding="utf-8-sig")
+    print(f"  Saved → {_out_ven} ({len(_ven_agg):,} deals)")
+# ══ Module 01a.SIC ══════════════════════════════════════════════════════════
+# ── cascade SIC recovery ──────────────────────────────────────────
 _nunique_sic = df_ind.groupby("deal_num")["acq_primary_sic_code"].transform(
-    lambda s: s.dropna().nunique()
-)
+    lambda s: s.dropna().nunique())
 _unique_val = df_ind.groupby("deal_num")["acq_primary_sic_code"].transform(
-    lambda s: s.dropna().iloc[0] if s.dropna().nunique() == 1 else np.nan
-)
-_fillable = df_ind["acq_primary_sic_code"].isna() & (_nunique_sic == 1)
-_is_target_row = df_ind["tar_name"].notna()
-n_recovered_kept = int((_fillable & _is_target_row).sum())
-n_ambiguous_kept = int((df_ind["acq_primary_sic_code"].isna() & (_nunique_sic >= 2) & _is_target_row).sum())
-# M2 FIXER R1: count target rows still missing acq_primary_sic_code where the
-# whole deal_num block has ZERO non-null candidates anywhere (truly unrecoverable —
-# not ambiguous, just no information exists in the block).
-n_unrecoverable_kept = int((df_ind["acq_primary_sic_code"].isna() & (_nunique_sic == 0) & _is_target_row).sum())
-df_ind.loc[_fillable, "acq_primary_sic_code"] = _unique_val[_fillable]
-print(f"\nCascade-row acq_primary_sic_code recovery (target rows only, tar_name notna): "
-      f"{n_recovered_kept:,} rows filled (unique candidate in deal_num block)")
-print(f"  Ambiguous (2+ distinct candidates, left NaN): {n_ambiguous_kept:,}")
-print(f"  Unrecoverable (0 candidates anywhere in deal_num block, left NaN): {n_unrecoverable_kept:,}")
-
-# ── Filter: keep only rows with target information ──────────────────────────
-# Cascade vendor/acquirer-only rows have tar_name=NaN.
-# Some valid target rows have tar_bvd_id_num=NaN (no BvD ID) but tar_name filled.
-n_before_filter = len(df_ind)
+    lambda s: s.dropna().iloc[0] if s.dropna().nunique() == 1 else np.nan)
+df_ind.loc[df_ind["acq_primary_sic_code"].isna() & (_nunique_sic == 1),
+           "acq_primary_sic_code"] = _unique_val[
+    df_ind["acq_primary_sic_code"].isna() & (_nunique_sic == 1)]
+n_before = len(df_ind)
 df_ind = df_ind[df_ind["tar_name"].notna()].copy()
-print(f"After drop rows with tar_name=NaN: {len(df_ind):,} rows "
-      f"(dropped {n_before_filter - len(df_ind):,} non-target cascade rows)")
-
-# ── Dedup by (deal_num, tar_key) ────────────────────────────────────────────
-# tar_key = tar_bvd_id_num when available, else tar_name (fallback)
-# This correctly handles multi-target deals where some targets lack BvD IDs.
+print(f"After drop tar_name=NaN: {len(df_ind):,} (dropped {n_before-len(df_ind):,})")
 df_ind["_tar_key"] = df_ind["tar_bvd_id_num"].fillna(df_ind["tar_name"])
-n_before_dedup = len(df_ind)
 df_ind = df_ind.drop_duplicates(subset=["deal_num", "_tar_key"], keep="first")
 df_ind = df_ind.drop(columns=["_tar_key"])
-print(f"After dedup by (deal_num, tar_key): {len(df_ind):,} rows "
-      f"(dropped {n_before_dedup - len(df_ind):,} duplicate rows)")
-
-# ── Convert deal_num to integer where possible ──────────────────────────────
 df_ind["deal_num"] = pd.to_numeric(df_ind["deal_num"], errors="coerce")
-df_ind = df_ind[df_ind["deal_num"].notna()]  # drop any remaining NaN deal_nums
-df_ind["deal_num"] = df_ind["deal_num"].astype("Int64")  # nullable integer
-
-print(f"\nModule A output: {len(df_ind):,} rows | "
-      f"{df_ind['deal_num'].nunique():,} unique deals")
-print(f"  tar_bvd_id_num missing: {df_ind['tar_bvd_id_num'].isna().sum():,} "
-      f"({df_ind['tar_bvd_id_num'].isna().mean()*100:.1f}%)")
-print(f"  tar_primary_sic_code missing: {df_ind['tar_primary_sic_code'].isna().sum():,} "
-      f"({df_ind['tar_primary_sic_code'].isna().mean()*100:.1f}%)")
-print(f"  tar_overview missing: {df_ind['tar_overview'].isna().sum():,} "
-      f"({df_ind['tar_overview'].isna().mean()*100:.1f}%)")
-
+df_ind = df_ind[df_ind["deal_num"].notna()]
+df_ind["deal_num"] = df_ind["deal_num"].astype("Int64")
 out_path_ind = os.path.join(CLEANED, "01_deal_sic_industry.csv")
 df_ind.to_csv(out_path_ind, index=False, encoding="utf-8-sig")
-print(f"\nSaved → {out_path_ind}")
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Module B — Multiples
-#   Source : raw/MA_deal/multiple/  (2 batches, ~58,975 raw rows)
-#   Output : data/cleaned/01_deal_multiples.csv
-#   Unit   : deal_num (one row per deal)
-# ════════════════════════════════════════════════════════════════════════════
-print("\n" + "=" * 60)
-print("MODULE B — Multiples")
-print("=" * 60)
-
-mul_dir = os.path.join(RAW_DEAL, "multiple")
-mul_files = sorted(glob.glob(os.path.join(mul_dir, "acquisition_multiple_*_cleaned.csv")))
-print(f"Found {len(mul_files)} multiple batch files")
-
-batches_mul = []
-for fp in mul_files:
-    batch_name = os.path.basename(fp)
-    df_b = read_and_ffill(fp)
-    n_raw = len(df_b)
-    df_b = clean_missing(df_b)
-    batches_mul.append(df_b)
-    print(f"  {batch_name}: {n_raw} rows read")
-
-df_mul = pd.concat(batches_mul, ignore_index=True)
-print(f"\nAfter stacking: {len(df_mul):,} rows")
-
-# Drop rows with missing deal_num (should be rare/none after ffill, but guard)
-n_before = len(df_mul)
-df_mul = df_mul[df_mul["deal_num"].notna()].copy()
-if n_before > len(df_mul):
-    print(f"Dropped {n_before - len(df_mul):,} rows with NaN deal_num after ffill")
-
-# F2 FIXER R1: verify duplicate rows in Module B are genuinely identical
-_dup_mask_b = df_mul.duplicated(subset=["deal_num"], keep=False)
-if _dup_mask_b.sum() > 0:
-    _dup_df_b = df_mul[_dup_mask_b]
-    _key_cols_b = [c for c in ["pre_rev_mul_ly", "pre_ebitda_mul_ly"] if c in _dup_df_b.columns]
-    if _key_cols_b:
-        _inconsistent_b = _dup_df_b.groupby("deal_num")[_key_cols_b].nunique(dropna=True)
-        _n_inconsistent_b = (_inconsistent_b > 1).any(axis=1).sum()
-        print(f"\nF2 CHECK Module B: {_dup_mask_b.sum()} duplicate rows across "
-              f"{_dup_df_b['deal_num'].nunique()} deals")
-        print(f"  Deals with DIFFERENT key values in duplicate rows: {_n_inconsistent_b}")
-        if _n_inconsistent_b > 0:
-            print(f"  WARNING: {_n_inconsistent_b} deals have inconsistent duplicate rows "
-                  f"— 'keep first' may lose real data")
-
-# Dedup by deal_num — keep first (multiples are deal-level attributes)
-n_before_dedup = len(df_mul)
+print(f"Saved → {out_path_ind}")
+# ══ Module 01a.multiple ═════════════════════════════════════════════════════
+print("\n" + "=" * 70); print("01a.multiple — Multiples"); print("=" * 70)
+mul_files = sorted(glob.glob(os.path.join(RAW_DEAL, "multiple",
+                                          "acquisition_multiple_*_cleaned.csv")))
+batches = [clean_missing(read_and_ffill(fp)) for fp in mul_files]
+df_mul = pd.concat(batches, ignore_index=True)
+df_mul = df_mul[df_mul["deal_num"].notna()]
 df_mul = df_mul.drop_duplicates(subset=["deal_num"], keep="first")
-print(f"After dedup by deal_num: {len(df_mul):,} rows "
-      f"(dropped {n_before_dedup - len(df_mul):,} duplicate rows)")
-
-# Convert deal_num to Int64
 df_mul["deal_num"] = pd.to_numeric(df_mul["deal_num"], errors="coerce").astype("Int64")
-
-# Convert multiple columns from string to numeric
-MUL_COLS = [c for c in df_mul.columns if c.endswith("_mul_ly") or c.endswith("_mul_fy")]
-for col in MUL_COLS:
+for col in [c for c in df_mul.columns if c.endswith(("_mul_ly", "_mul_fy"))]:
     df_mul[col] = pd.to_numeric(df_mul[col], errors="coerce")
-
-print(f"\nModule B output: {len(df_mul):,} rows | "
-      f"{df_mul['deal_num'].nunique():,} unique deals")
-print(f"  pre_rev_mul_ly missing: {df_mul['pre_rev_mul_ly'].isna().sum():,} "
-      f"({df_mul['pre_rev_mul_ly'].isna().mean()*100:.1f}%)")
-print(f"  pre_ebitda_mul_ly missing: {df_mul['pre_ebitda_mul_ly'].isna().sum():,} "
-      f"({df_mul['pre_ebitda_mul_ly'].isna().mean()*100:.1f}%)")
-print(f"  pre_ebit_mul_ly missing: {df_mul['pre_ebit_mul_ly'].isna().sum():,} "
-      f"({df_mul['pre_ebit_mul_ly'].isna().mean()*100:.1f}%)")
-
-# === 新增post系列缺失率打印 ===================================================
-print(f"  post_rev_mul_fy missing: {df_mul['post_rev_mul_fy'].isna().sum():,} "
-      f"({df_mul['post_rev_mul_fy'].isna().mean()*100:.1f}%)")
-print(f"  post_ebitda_mul_fy missing: {df_mul['post_ebitda_mul_fy'].isna().sum():,} "
-      f"({df_mul['post_ebitda_mul_fy'].isna().mean()*100:.1f}%)")
-print(f"  post_ebit_mul_fy missing: {df_mul['post_ebit_mul_fy'].isna().sum():,} "
-      f"({df_mul['post_ebit_mul_fy'].isna().mean()*100:.1f}%)")
-# Drop the row-index column (unnamed_0) from output
 if "unnamed_0" in df_mul.columns:
     df_mul = df_mul.drop(columns=["unnamed_0"])
-
 out_path_mul = os.path.join(CLEANED, "01_deal_multiples.csv")
 df_mul.to_csv(out_path_mul, index=False, encoding="utf-8-sig")
-print(f"\nSaved → {out_path_mul}")
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Module C — Structure & Dates
-#   Source : raw/MA_deal/structure_date/  (2 batches)
-#   Output : data/cleaned/01_deal_structure_date.csv
-#   Unit   : deal_num (one row per deal)
-# ════════════════════════════════════════════════════════════════════════════
-print("\n" + "=" * 60)
-print("MODULE C — Structure & Dates")
-print("=" * 60)
-
-sd_dir = os.path.join(RAW_DEAL, "structure_date")
-sd_files = sorted(glob.glob(os.path.join(sd_dir, "acquisition_structure_date_*_cleaned.csv")))
-print(f"Found {len(sd_files)} structure_date batch files")
-
-batches_sd = []
-for fp in sd_files:
-    batch_name = os.path.basename(fp)
-    df_b = read_and_ffill(fp)
-    n_raw = len(df_b)
-    df_b = clean_missing(df_b)
-    batches_sd.append(df_b)
-    print(f"  {batch_name}: {n_raw} rows read")
-
-df_sd = pd.concat(batches_sd, ignore_index=True)
-print(f"\nAfter stacking: {len(df_sd):,} rows")
-
-# Drop rows with missing deal_num
-n_before = len(df_sd)
+print(f"Module 01a.multiple: {len(df_mul):,} rows → {out_path_mul}")
+# ══ Module 01a.structure_date ═══════════════════════════════════════════════
+print("\n" + "=" * 70); print("01a.structure_date — Structure & Dates"); print("=" * 70)
+sd_files = sorted(glob.glob(os.path.join(RAW_DEAL, "structure_date",
+                                         "acquisition_structure_date_*_cleaned.csv")))
+batches = [clean_missing(read_and_ffill(fp)) for fp in sd_files]
+df_sd = pd.concat(batches, ignore_index=True)
 df_sd = df_sd[df_sd["deal_num"].notna()].copy()
-if n_before > len(df_sd):
-    print(f"Dropped {n_before - len(df_sd):,} rows with NaN deal_num")
-
-# ══ CATEGORICAL FIELD AGGREGATION (2026-09-08) ═══════════════════════════
-# Zephyr 对多值分类字段采用「一值一行」存储。Module C 按 deal_num keep-first
-# 去重会静默丢弃第二行起的取值。
-#
-# 实测损失：
-#   deal_pay_method : 多值 deal 1,735 | 换股占比被低估 13.4% → 18.6%
-#   deal_struct     : 多值 deal 6,435 | 每 deal 均值 1.49 个取值 ← 更严重
-#
-# 故所有分类字段统一在 dedup 之前聚合为竖线分隔集合。
-# 新增字段：只需在下面列表里加一个字符串，不要再写特化代码。
-CATEGORICAL_AGG = [
-    "deal_pay_method",
-    "deal_struct",
-    "deal_fin",
-    "deal_type",
-]
-
-# ⚠️ 后处理/特殊情境取值 —— 聚合后仅标记，禁止进入任何回归
-STRUCT_POSTTREAT = {
-    "Public takeover - Unsuccessful",
-    "Public takeover - Withdrawn",
-}
-STRUCT_DISTRESS = {
-    "Receivership", "Insolvency", "Administration",
-    "Nationalisation", "Distressed Debt",
-}
-
+CATEGORICAL_AGG = ["deal_pay_method", "deal_struct", "deal_fin", "deal_type"]
+print("\nCATEGORICAL AGG")
 _agg_frames = []
-print("\n" + "=" * 70)
-print("CATEGORICAL AGG — 分类字段去重前聚合")
-print("=" * 70)
-
 for _src in CATEGORICAL_AGG:
     if _src not in df_sd.columns:
-        print(f"  {_src:<20s} 跳过（不在数据中）")
         continue
-
     _sub = df_sd.dropna(subset=[_src])
     if _sub.empty:
-        print(f"  {_src:<20s} 跳过（全缺失）")
         continue
-
-    _out = f"{_src}_all"
-    _cnt = f"{_src}_n"
     _g = (_sub.groupby("deal_num")[_src]
           .apply(lambda x: "|".join(sorted(set(x.astype(str)))))
-          .rename(_out).to_frame())
-    _g[_cnt] = _g[_out].str.split("|").apply(len)
+          .rename(_src + "_all").to_frame())
+    _g[_src + "_n"] = _g[_src + "_all"].str.split("|").apply(len)
     _g = _g.reset_index()
-
-    _n_deal = len(_g)
-    _n_multi = int((_g[_cnt] > 1).sum())
-    print(f"\n  【{_src}】{_n_deal:,} deals 有值 | "
-          f"多值 deal {_n_multi:,} ({_n_multi/max(_n_deal,1):.1%}) | "
-          f"每 deal 均值 {_g[_cnt].mean():.2f}")
-
+    print(f"  [{_src}] {len(_g):,} deals | multi {int((_g[_src+'_n']>1).sum()):,}")
     _agg_frames.append(_g)
-
-    # ── deal_pay_method：保留换股低估诊断 ──
-    if _src == "deal_pay_method":
-        _first = (_sub.drop_duplicates("deal_num", keep="first")
-                  .set_index("deal_num")[_src].astype(str))
-        _cmp = _g.set_index("deal_num")[[_out]].join(
-            _first.rename("_first"), how="left")
-        _has = _cmp[_out].str.contains("Shares", na=False)
-        _lost = int((_has & (_cmp["_first"] != "Shares")).sum())
-        print(f"     ⚠️ {_lost:,} 笔含换股但去重首行非 Shares → 信息被丢弃")
-        print(f"        去重口径 {_cmp['_first'].eq('Shares').mean():.1%}"
-              f"  →  聚合口径 {_has.mean():.1%}")
-
-    # ── deal_struct：输出全取值域（供分类映射用）──
-    if _src == "deal_struct":
-        _vals = _sub[_src].astype(str).value_counts()
-        print(f"\n     [取值域] {len(_vals)} 个取值，全部列出：")
-        for _v, _n in _vals.items():
-            _flag = ""
-            if _v in STRUCT_POSTTREAT:
-                _flag = "  ⚠️后处理-禁入回归"
-            elif _v in STRUCT_DISTRESS:
-                _flag = "  ⚠️破产/接管-建议剔样本"
-            print(f"       {_v:<44s} {_n:>7,}{_flag}")
-
-        print(f"\n     [聚合后组合] Top 15：")
-        for _v, _n in _g[_out].value_counts().head(15).items():
-            print(f"       {str(_v):<60s} {_n:>7,}")
-
-        # 后处理 / 困境类规模
-        for _lab, _set in [("后处理", STRUCT_POSTTREAT),
-                           ("困境情境", STRUCT_DISTRESS)]:
-            _m = _g[_out].apply(
-                lambda s: bool({x.strip() for x in str(s).split("|")} & _set))
-            print(f"     含【{_lab}】标记的 deal: {int(_m.sum()):,} "
-                  f"({_m.mean():.1%})")
-
-# ── 合并所有聚合结果 ──
+_agg_all = None
 if _agg_frames:
     _agg_all = _agg_frames[0]
     for _f in _agg_frames[1:]:
         _agg_all = _agg_all.merge(_f, on="deal_num", how="outer")
-    _agg_all["deal_num"] = pd.to_numeric(
-        _agg_all["deal_num"], errors="coerce").astype("Int64")
-    print(f"\n  聚合表就绪：{len(_agg_all):,} deals | "
-          f"{len(_agg_all.columns)-1} 个新列")
-else:
-    _agg_all = None
-    print("\n  ⚠️ 没有任何字段被聚合")
-# ══ CATEGORICAL AGGREGATION end ═══════════════════════════════════════════
-   
-# F2 FIXER R1: verify duplicate rows in Module C are genuinely identical
-_dup_mask_c = df_sd.duplicated(subset=["deal_num"], keep=False)
-if _dup_mask_c.sum() > 0:
-    _dup_df_c = df_sd[_dup_mask_c]
-    _key_cols_c = [c for c in ["deal_status", "completed_d_yr"] if c in _dup_df_c.columns]
-    if _key_cols_c:
-        _inconsistent_c = _dup_df_c.groupby("deal_num")[_key_cols_c].nunique(dropna=True)
-        _n_inconsistent_c = (_inconsistent_c > 1).any(axis=1).sum()
-        print(f"\nF2 CHECK Module C: {_dup_mask_c.sum()} duplicate rows across "
-              f"{_dup_df_c['deal_num'].nunique()} deals")
-        print(f"  Deals with DIFFERENT key values in duplicate rows: {_n_inconsistent_c}")
-        if _n_inconsistent_c > 0:
-            print(f"  WARNING: {_n_inconsistent_c} deals have inconsistent duplicate rows "
-                  f"— 'keep first' may lose real data")
-
-# Dedup by deal_num — keep first (deal status and dates are deal-level)
-n_before_dedup = len(df_sd)
+    _agg_all["deal_num"] = pd.to_numeric(_agg_all["deal_num"], errors="coerce").astype("Int64")
 df_sd = df_sd.drop_duplicates(subset=["deal_num"], keep="first")
-print(f"After dedup by deal_num: {len(df_sd):,} rows "
-      f"(dropped {n_before_dedup - len(df_sd):,} duplicate rows)")
-
-# Convert deal_num to Int64
-#df_sd["deal_num"] = pd.to_numeric(df_sd["deal_num"], errors="coerce").astype("Int64")
-
-# Select key columns for analysis
-#SD_KEEP = [
-   # "deal_num",
-    #"deal_type", "deal_status", "deal_struct", "deal_fin", "deal_pay_method",
-   # "announced_d", "completed_d", "withdrawn_d",
-   # "announced_d_yr", "completed_d_yr", "withdrawn_d_yr",
-    #"assumed_comp_d",   # needed by Script 08 DaysToCompletion (fallback end date)
-#]
-# Convert deal_num to Int64
-
 df_sd["deal_num"] = pd.to_numeric(df_sd["deal_num"], errors="coerce").astype("Int64")
-
-# ── 把去重前聚合的分类字段 merge 回来 end 260907──
 if _agg_all is not None:
     df_sd = df_sd.merge(_agg_all, on="deal_num", how="left")
-    _mp = int(df_sd["deal_pay_method_all"].isna().sum())
-    print(f"  CATEGORICAL AGG merged: {len(df_sd)-_mp:,}/{len(df_sd):,} deals 有支付方式 | "
-          f"缺失 {_mp:,} ({_mp/len(df_sd):.1%})")
-    for _c in [c for c in df_sd.columns if c.endswith("_all")]:
-        print(f"    {_c:<28s} 覆盖 {df_sd[_c].notna().mean():.1%}")
-# ── 把去重前聚合的分类字段 merge 回来 end 260907──
-        
-        
-# Select key columns for analysis
-SD_KEEP = [
-    "deal_num",
-    "deal_type", "deal_status", "deal_struct", "deal_fin", "deal_pay_method",
-    # ── 去重前聚合的分类字段（2026-09-08）──
-    "deal_pay_method_all", "deal_pay_method_n",
-    "deal_struct_all",     "deal_struct_n",
-    "deal_fin_all",        "deal_fin_n",
-    "deal_type_all",       "deal_type_n",
-    "announced_d", "completed_d", "withdrawn_d",
-    "announced_d_yr", "completed_d_yr", "withdrawn_d_yr",
-    "assumed_comp_d",
-]
-SD_KEEP_PRESENT = [c for c in SD_KEEP if c in df_sd.columns]
-df_sd = df_sd[SD_KEEP_PRESENT].copy()
+SD_KEEP = ["deal_num", "deal_type", "deal_status", "deal_struct", "deal_fin",
+           "deal_pay_method", "deal_pay_method_all", "deal_pay_method_n",
+           "deal_struct_all", "deal_struct_n", "deal_fin_all", "deal_fin_n",
+           "deal_type_all", "deal_type_n",
+           "announced_d", "completed_d", "withdrawn_d",
+           "announced_d_yr", "completed_d_yr", "withdrawn_d_yr", "assumed_comp_d"]
 
-# m5 FIXER R1: cast year columns to Int64 (not float) to prevent float residue
-for yr_col in ["announced_d_yr", "completed_d_yr", "withdrawn_d_yr"]:
-    if yr_col in df_sd.columns:
-        df_sd[yr_col] = pd.to_numeric(df_sd[yr_col], errors="coerce").astype("Int64")
+# ── Rumor date (JFE 2021 dialogue) ─────────────────────────────────────
+# BvD column names may use British "rumour_*" or American "rumor_*"; probe both.
+RUM_D_COL  = next((c for c in ["rumour_d", "rumor_d"] if c in df_sd.columns), None)
+RUM_YR_COL = next((c for c in ["rumour_d_yr", "rumor_d_yr"] if c in df_sd.columns), None)
+if RUM_D_COL:
+    print(f"  [rumor] Found rumor date column: {RUM_D_COL}"
+          + (f" / {RUM_YR_COL}" if RUM_YR_COL else ""))
+    SD_KEEP.append(RUM_D_COL)
+else:
+    print("  [warn] rumour_d/rumor_d not found in raw structure_date columns")
+    print("         Existing columns:", [c for c in df_sd.columns if "rum" in c.lower()])
+if RUM_YR_COL and RUM_YR_COL not in SD_KEEP:
+    SD_KEEP.append(RUM_YR_COL)
 
-if "announced_d_yr" in df_sd.columns and "completed_d_yr" in df_sd.columns:
+df_sd = df_sd[[c for c in SD_KEEP if c in df_sd.columns]].copy()
+for yc in ["announced_d_yr", "completed_d_yr", "withdrawn_d_yr"]:
+    if yc in df_sd.columns:
+        df_sd[yc] = pd.to_numeric(df_sd[yc], errors="coerce").astype("Int64")
+if RUM_YR_COL and RUM_YR_COL in df_sd.columns:
+    df_sd[RUM_YR_COL] = pd.to_numeric(df_sd[RUM_YR_COL], errors="coerce").astype("Int64")
+if {"announced_d_yr", "completed_d_yr"} <= set(df_sd.columns):
     df_sd["deal_duration_yr"] = df_sd["completed_d_yr"] - df_sd["announced_d_yr"]
 
-# M6 FIXER R1: validate deal_duration_yr after computation
-if "deal_duration_yr" in df_sd.columns:
-    _dur = df_sd["deal_duration_yr"].dropna()
-    _n_negative = (_dur < 0).sum()
-    _n_extreme = (_dur > 10).sum()
-    print(f"\nM6 deal_duration_yr validation:")
-    print(f"  Non-missing: {len(_dur):,} / {len(df_sd):,}")
-    print(f"  Negative values (completed < announced): {_n_negative}")
-    print(f"  Extreme values (>10 years): {_n_extreme}")
-    if len(_dur) > 0:
-        print(f"  Distribution: min={_dur.min():.0f} p5={_dur.quantile(.05):.0f} "
-              f"median={_dur.median():.0f} p95={_dur.quantile(.95):.0f} max={_dur.max():.0f}")
-    if _n_negative > 0:
-        print(f"  WARNING: {_n_negative} deals have negative duration — likely data entry error")
-        _neg_cols = [c for c in ["deal_num","announced_d_yr","completed_d_yr","deal_duration_yr"]
-                     if c in df_sd.columns]
-        print(df_sd[df_sd["deal_duration_yr"] < 0][_neg_cols].head(5).to_string(index=False))
+# -- has_rumor: rumor date non-empty OR deal_status contains Rumour ------------
+_status = df_sd["deal_status"].astype(str).str.lower()
+df_sd["has_rumor_status"] = _status.str.contains("rumour|rumor").astype(int)
+if RUM_D_COL and RUM_D_COL in df_sd.columns:
+    df_sd["has_rumor_date"] = df_sd[RUM_D_COL].notna().astype(int)
+    df_sd["has_rumor"] = (df_sd["has_rumor_date"] | df_sd["has_rumor_status"]).astype(int)
+else:
+    df_sd["has_rumor"] = df_sd["has_rumor_status"]
 
-print(f"\nModule C output: {len(df_sd):,} rows | "
-      f"{df_sd['deal_num'].nunique():,} unique deals")
-print(f"  deal_status missing: {df_sd['deal_status'].isna().sum():,}")
-print(f"  completed_d_yr missing: {df_sd['completed_d_yr'].isna().sum():,} "
-      f"({df_sd['completed_d_yr'].isna().mean()*100:.1f}%)")
+# -- Rumor lead (relative to announced): year gap + day gap -------------------
+if RUM_YR_COL and RUM_YR_COL in df_sd.columns and "announced_d_yr" in df_sd.columns:
+    df_sd["rumor_lead_yr"] = df_sd["announced_d_yr"] - df_sd[RUM_YR_COL]
+if RUM_D_COL and RUM_D_COL in df_sd.columns and "announced_d" in df_sd.columns:
+    try:
+        _rum = pd.to_datetime(df_sd[RUM_D_COL], errors="coerce")
+        _ann = pd.to_datetime(df_sd["announced_d"], errors="coerce")
+        df_sd["rumor_lead_days"] = (_ann - _rum).dt.days
+    except Exception as _e:
+        print(f"  [warn] rumor_lead_days computation failed: {_e}")
 
-if "unnamed_0" in df_sd.columns:
-    df_sd = df_sd.drop(columns=["unnamed_0"])
+# -- Verification: rumor vs announced overlap ----------------------------------
+print("\n  -- Rumor x Announced overlap check --")
+_n_total = len(df_sd)
+_n_rum_date = int(df_sd["has_rumor_date"].sum()) if "has_rumor_date" in df_sd.columns else 0
+_n_rum_status = int(df_sd["has_rumor_status"].sum())
+_n_rum_any = int(df_sd["has_rumor"].sum())
+_n_ann = int(df_sd["announced_d_yr"].notna().sum()) if "announced_d_yr" in df_sd.columns else 0
+print(f"  Total deals:             {_n_total:>8,}")
+print(f"  has_rumor (any source):  {_n_rum_any:>8,}  ({_n_rum_any/_n_total:.1%})")
+print(f"    of which rumor date non-empty: {_n_rum_date:>8,}  ({_n_rum_date/_n_total:.1%})")
+print(f"    of which status contains Rumour:{_n_rum_status:>8,}  ({_n_rum_status/_n_total:.1%})")
+print(f"  Has announced year:      {_n_ann:>8,}")
+if "has_rumor_date" in df_sd.columns and "announced_d_yr" in df_sd.columns:
+    _both = df_sd[(df_sd["has_rumor_date"] == 1) & df_sd["announced_d_yr"].notna()]
+    _rum_only = df_sd[(df_sd["has_rumor_date"] == 1) & df_sd["announced_d_yr"].isna()]
+    _ann_only = df_sd[(df_sd["has_rumor_date"] == 0) & df_sd["announced_d_yr"].notna()]
+    print(f"\n  rumor_date=1 AND announced=1: {len(_both):>6,}  "
+          f"(share of rumor_date: {len(_both)/max(_n_rum_date,1):.1%})")
+    print(f"  Rumor only, no announced:  {len(_rum_only):>6,}  (mostly failed/withdrawn)")
+    print(f"  Announced only, no rumor:  {len(_ann_only):>6,}")
+    if "rumor_lead_yr" in df_sd.columns and len(_both) > 0:
+        _ld = _both["rumor_lead_yr"].dropna()
+        print(f"\n  rumor_lead_yr (rumor->announce, both present only):")
+        print(f"    N={len(_ld):,}  mean={_ld.mean():.2f}  median={_ld.median():.0f}"
+              f"  p10={_ld.quantile(.1):.0f}  p90={_ld.quantile(.9):.0f}")
+        print(f"    Same year (lead=0): {(_ld==0).sum():,} ({(_ld==0).mean():.1%})")
+        print(f"    lead>=0 (rumor precedes announce): {(_ld>=0).sum():,} "
+              f"({(_ld>=0).mean():.1%})")
+        print(f"    lead<0 (announce precedes rumor, anomaly): {(_ld<0).sum():,} "
+              f"({(_ld<0).mean():.1%})")
+    if "rumor_lead_days" in df_sd.columns and len(_both) > 0:
+        _ldd = _both["rumor_lead_days"].dropna()
+        if len(_ldd) > 0:
+            print(f"\n  rumor_lead_days: mean={_ldd.mean():.1f}  median={_ldd.median():.0f}"
+                  f"  p25={_ldd.quantile(.25):.0f}  p75={_ldd.quantile(.75):.0f}")
+# rumor deals completion rate (JFE key fact: rumor is a deal breaker)
+if "deal_status" in df_sd.columns:
+    _st = df_sd["deal_status"].astype(str)
+    df_sd["completed_flag"] = _st.str.strip().str.startswith("Completed").astype(int)
+    _rum_done = df_sd[df_sd["has_rumor"] == 1]["completed_flag"].mean()
+    _non_done = df_sd[df_sd["has_rumor"] == 0]["completed_flag"].mean()
+    print(f"\n  Completion rate comparison (JFE benchmark):")
+    print(f"    has_rumor=1: {_rum_done:.1%}  (N={int(df_sd['has_rumor'].sum()):,})")
+    print(f"    has_rumor=0: {_non_done:.1%}  (N={int((1-df_sd['has_rumor']).sum()):,})")
 
 out_path_sd = os.path.join(CLEANED, "01_deal_structure_date.csv")
 df_sd.to_csv(out_path_sd, index=False, encoding="utf-8-sig")
-print(f"\nSaved → {out_path_sd}")
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Module D — Value
-#   Source : raw/MA_deal/value/  (2 batches, ~58,975 raw rows)
-#   Output : data/cleaned/01_deal_value.csv
-#   Unit   : deal_num (one row per deal)
-#   Note   : deal_value filter (≥ $1M) applied in Step 5 (sample selection),
-#             not here. We keep all rows including those with missing deal_value.
-# ════════════════════════════════════════════════════════════════════════════
-print("\n" + "=" * 60)
-print("MODULE D — Value")
-print("=" * 60)
-
-val_dir = os.path.join(RAW_DEAL, "value")
-val_files = sorted(glob.glob(os.path.join(val_dir, "acquisition_value_*_cleaned.csv")))
-print(f"Found {len(val_files)} value batch files")
-
-batches_val = []
-for fp in val_files:
-    batch_name = os.path.basename(fp)
-    df_b = read_and_ffill(fp)
-    n_raw = len(df_b)
-    df_b = clean_missing(df_b)
-    batches_val.append(df_b)
-    print(f"  {batch_name}: {n_raw} rows read")
-
-df_val = pd.concat(batches_val, ignore_index=True)
-print(f"\nAfter stacking: {len(df_val):,} rows")
-
-# Drop rows with missing deal_num
-n_before = len(df_val)
-df_val = df_val[df_val["deal_num"].notna()].copy()
-if n_before > len(df_val):
-    print(f"Dropped {n_before - len(df_val):,} rows with NaN deal_num")
-
-# F2 FIXER R1: verify duplicate rows in Module D are genuinely identical
-_dup_mask_d = df_val.duplicated(subset=["deal_num"], keep=False)
-if _dup_mask_d.sum() > 0:
-    _dup_df_d = df_val[_dup_mask_d]
-    _key_cols_d = [c for c in ["deal_value", "stake_acq_pct"] if c in _dup_df_d.columns]
-    if _key_cols_d:
-        _inconsistent_d = _dup_df_d.groupby("deal_num")[_key_cols_d].nunique(dropna=True)
-        _n_inconsistent_d = (_inconsistent_d > 1).any(axis=1).sum()
-        print(f"\nF2 CHECK Module D: {_dup_mask_d.sum()} duplicate rows across "
-              f"{_dup_df_d['deal_num'].nunique()} deals")
-        print(f"  Deals with DIFFERENT key values in duplicate rows: {_n_inconsistent_d}")
-        if _n_inconsistent_d > 0:
-            print(f"  WARNING: {_n_inconsistent_d} deals have inconsistent duplicate rows "
-                  f"— 'keep first' may lose real data")
-            # Print 5 sample rows to understand the structure of inconsistency
-            _incon_deals = _inconsistent_d[(_inconsistent_d > 1).any(axis=1)].index[:3]
-            _sample_cols = ["deal_num"] + _key_cols_d + (["currency"] if "currency" in _dup_df_d.columns else [])
-            print(f"  Sample inconsistent deals (showing up to 3):")
-            print(_dup_df_d[_dup_df_d["deal_num"].isin(_incon_deals)][_sample_cols].to_string(index=False))
-
-# Dedup by deal_num — keep first
-n_before_dedup = len(df_val)
+print(f"\nModule 01a.structure_date: {len(df_sd):,} rows → {out_path_sd}")
+# ══ Module 01a.value ════════════════════════════════════════════════════════
+print("\n" + "=" * 70); print("MODULE 01a.value — Value"); print("=" * 70)
+val_files = sorted(glob.glob(os.path.join(RAW_DEAL, "value",
+                                          "acquisition_value_*_cleaned.csv")))
+batches = [clean_missing(read_and_ffill(fp)) for fp in val_files]
+df_val = pd.concat(batches, ignore_index=True)
+df_val = df_val[df_val["deal_num"].notna()]
 df_val = df_val.drop_duplicates(subset=["deal_num"], keep="first")
-print(f"After dedup by deal_num: {len(df_val):,} rows "
-      f"(dropped {n_before_dedup - len(df_val):,} duplicate rows)")
-
-# Convert deal_num to Int64
 df_val["deal_num"] = pd.to_numeric(df_val["deal_num"], errors="coerce").astype("Int64")
-
-# Select key value columns
-VAL_KEEP = [
-    "deal_num",
-    "deal_value",                        # USD deal value (th USD)
-    "deal_enterprise_value",             # EV (th USD)
-    "deal_equity_value",                 # Equity value (th USD)
-    "deal_modelled_enterprise_value",    # Modelled EV
-    "stake_acq_pct",                     # Acquired stake % (for ≥50% filter)
-    "stake_final_pct",                   # Final stake %
-    "currency",
-]
-VAL_KEEP_PRESENT = [c for c in VAL_KEEP if c in df_val.columns]
-df_val = df_val[VAL_KEEP_PRESENT].copy()
-
-# Convert numeric columns
-NUM_COLS_VAL = [c for c in VAL_KEEP_PRESENT if c not in ("deal_num", "currency")]
-for col in NUM_COLS_VAL:
-    df_val[col] = pd.to_numeric(df_val[col], errors="coerce")
-
-print(f"\nModule D output: {len(df_val):,} rows | "
-      f"{df_val['deal_num'].nunique():,} unique deals")
-print(f"  deal_value missing: {df_val['deal_value'].isna().sum():,} "
-      f"({df_val['deal_value'].isna().mean()*100:.1f}%)")
-print(f"  deal_enterprise_value missing: {df_val['deal_enterprise_value'].isna().sum():,} "
-      f"({df_val['deal_enterprise_value'].isna().mean()*100:.1f}%)")
-print(f"  stake_acq_pct missing: {df_val['stake_acq_pct'].isna().sum():,} "
-      f"({df_val['stake_acq_pct'].isna().mean()*100:.1f}%)")
-
-# m3 FIXER R1: warn if deal_enterprise_value coverage is too low for regressions
-if "deal_enterprise_value" in df_val.columns:
-    _ev_coverage = df_val["deal_enterprise_value"].notna().mean() * 100
-    if _ev_coverage < 20:
-        print(f"  WARNING: deal_enterprise_value coverage = {_ev_coverage:.1f}% "
-              f"— essentially unusable in regressions")
-        print(f"  EV-based multiples (EV/EBITDA) will require a separate data source "
-              f"or restricted sample")
-
-if "unnamed_0" in df_val.columns:
-    df_val = df_val.drop(columns=["unnamed_0"])
-
+VAL_KEEP = ["deal_num", "deal_value", "deal_enterprise_value", "deal_equity_value",
+            "deal_modelled_enterprise_value", "stake_acq_pct", "stake_final_pct", "currency"]
+df_val = df_val[[c for c in VAL_KEEP if c in df_val.columns]].copy()
+for c in [c for c in df_val.columns if c not in ("deal_num", "currency")]:
+    df_val[c] = pd.to_numeric(df_val[c], errors="coerce")
 out_path_val = os.path.join(CLEANED, "01_deal_value.csv")
 df_val.to_csv(out_path_val, index=False, encoding="utf-8-sig")
-print(f"\nSaved → {out_path_val}")
-
-# ════════════════════════════════════════════════════════════════════════════
-# Module E — Deal Info Source Category (Deal-level 信息来源分类)
-#   Source : raw/MA_deal/info_source/ 单文件 deal_info_source_categories.csv
-#   Output : data/cleaned/01_deal_info_source.csv
-#   Unit   : 每条信息来源一条记录 (一个deal_num对应多行不同source)
-# ════════════════════════════════════════════════════════════════════════════
-print("\n" + "=" * 60)
-print("MODULE F — Deal Info Source Category")
-print("=" * 60)
-
-info_src_dir = os.path.join(BASE, "raw", "MA_deal", "info_source")
-info_src_fp = os.path.join(info_src_dir, "deal_info_source_categories.csv")
-print(f"Reading single source file: {os.path.basename(info_src_fp)}")
-
-# 1 先原生读取，不再提前调用read_and_ffill（原始列是dealnumber，无deal_num）
+print(f"Module 01a.value: {len(df_val):,} rows → {out_path_val}")
+# ══ Module 01a.infor_source ═════════════════════════════════════════════════
+print("\n" + "=" * 70); print("MODULE 01a.infor_source — Info Source"); print("=" * 70)
+info_src_fp = os.path.join(BASE, "raw", "MA_deal", "info_source",
+                           "deal_info_source_categories.csv")
 df_src = pd.read_csv(info_src_fp, encoding="utf-8-sig", low_memory=False)
 df_src.columns = df_src.columns.str.strip()
-n_raw = len(df_src)
-print(f"Raw total rows: {n_raw:,}")
-
-# 2 【关键修复】先重命名字段，把dealnumber改为deal_num
 df_src = df_src.rename(columns={
-    "dealnumber": "deal_num",
-    "categoryofsource": "source_category",
-    "sourcedocumentation": "source_document",
-    "targetname": "tar_name",
-    "targetbvdidnumber": "tar_bvd_id_num",
-    "targetorbisidnumber": "tar_orbis_id_num",
-    "acquirorname": "acq_name",
-    "acquirorbisidnumber": "acq_orbis_id_num",
-    "acquirorbvdidnumber": "acq_bvd_id_num",
-    "vendorname": "ven_name",
-    "vendorbvdidnumber": "ven_bvdidnumber",
-    "index": "src_index"
-})
-
-# 3 现在才有deal_num，执行前向填充处理拆分行
+    "dealnumber": "deal_num", "categoryofsource": "source_category",
+    "sourcedocumentation": "source_document", "targetname": "tar_name",
+    "targetbvdidnumber": "tar_bvd_id_num", "targetorbisidnumber": "tar_orbis_id_num",
+    "acquirorname": "acq_name", "acquirorbisidnumber": "acq_orbis_id_num",
+    "acquirorbvdidnumber": "acq_bvd_id_num", "vendorname": "ven_name",
+    "vendorbvdidnumber": "ven_bvd_id_num", "index": "src_index"})
 df_src["deal_num"] = df_src["deal_num"].ffill()
-
-# 清洗缺失占位符
 df_src = clean_missing(df_src)
-
-# var1纯索引无意义，直接删除
-drop_cols = ["var1"]
-df_src = df_src.drop(columns=drop_cols, errors="ignore")
-
-# 过滤deal_num为空无效行
-n_before_filter = len(df_src)
+df_src = df_src.drop(columns=["var1"], errors="ignore")
 df_src = df_src[df_src["deal_num"].notna()].copy()
-print(f"Dropped rows with empty deal_num: {n_before_filter - len(df_src):,}")
-
-# deal_num统一转为可空整数
 df_src["deal_num"] = pd.to_numeric(df_src["deal_num"], errors="coerce").astype("Int64")
-
-# ---------------------- 清洗 source_category：逐行剥离括号后缀 ----------------------
-import re
-
 def extract_main_cat(text):
     if pd.isna(text):
         return np.nan
     s = str(text).strip()
     m = re.match(r"(.*?)\s*\(", s)
-    if m:
-        return m.group(1).strip()
-    return s
-
-# 逐行处理原始每行，不做任何文本合并
+    return m.group(1).strip() if m else s
 df_src["source_main_cat"] = df_src["source_category"].apply(extract_main_cat)
-
-main_source_list = [
-    "Stock Exchange",
-    "Website",
-    "Company Press Release",
-    "Electronic Publication",
-    "Advisor Submission",
-    "Miscellaneous"
-]
-
-# ========== 1. 行级 dummy（仅用于中间计算，不单独输出） ==========
+main_source_list = ["Stock Exchange", "Website", "Company Press Release",
+                    "Electronic Publication", "Advisor Submission", "Miscellaneous"]
 for src in main_source_list:
-    col = "num_" + src.replace(" ", "_")
-    df_src[col] = (df_src["source_main_cat"] == src).astype(int)
-
+    df_src["num_" + src.replace(" ", "_")] = (df_src["source_main_cat"] == src).astype(int)
 df_src["num_source_other"] = (~df_src["source_main_cat"].isin(main_source_list)).astype(int)
-
 dummy_cols = [c for c in df_src.columns if c.startswith("num_")]
-
-# ========== 2. 按 deal_num 求和：一个 deal 该来源出现几次，值就是几 ==========
 deal_source_df = df_src.groupby("deal_num")[dummy_cols].sum().reset_index()
-
-# 输出唯一一张 deal 级表（值为计数：0,1,2,3,4...）
 out_path_src = os.path.join(CLEANED, "01_deal_info_source_count.csv")
 deal_source_df.to_csv(out_path_src, index=False, encoding="utf-8-sig")
-print(f"\nSaved deal-level source count table → {out_path_src}")
-
-# 校验：每个 deal 的来源种类数分布（非 0 的列数）
-deal_source_df["n_source_types"] = (deal_source_df[dummy_cols] > 0).sum(axis=1)
-print("\n==== Deal-level: number of distinct source types per deal ====")
-print(deal_source_df["n_source_types"].value_counts().sort_index())
-
-# ========== 主类别统计（基于明细行） ==========
-total_source_records = len(df_src)
-src_main_stat = df_src["source_main_cat"].value_counts().reset_index()
-src_main_stat.columns = ["source_main_cat", "count"]
-src_main_stat["pct"] = (src_main_stat["count"] / total_source_records) * 100
-
-print(f"\n==== Cleaned Main Source Category Statistics (Total: {total_source_records:,}) ====")
-for _, row in src_main_stat.iterrows():
-    cat = row["source_main_cat"]
-    cnt = row["count"]
-    pct = row["pct"]
-    print(f"{cat:<26} {cnt:>8}    {pct:.8f}")
-# ════════════════════════════════════════════════════════════════════════════
-# Summary
-# ════════════════════════════════════════════════════════════════════════════
-print("\n" + "=" * 60)
-print("SUMMARY — Script 01 Complete")
-print("=" * 60)
+print(f"Module 01a.infor_source: {len(deal_source_df):,} deals → {out_path_src}")
+# ══ Module 01a.vendorNER ════════════════════════════════════════════════════
+print("\n" + "=" * 70)
+print("Module 01a.vendorNER — Vendor Identity (Stanford CoreNLP NER)")
+print("=" * 70)
+# NOTE (2026-09-18): This module is SUPERSEDED by 01d_vendor_identity.py
+# (v4). Vendor classification now lives in 01d — it reuses the NER cache
+# and degrades gracefully without Java, and re-writes the same output
+# files (01_deal_vendor_type.csv, 01_deal_vendor_type_profile.csv).
+# Module kept here for run_all compatibility; 01d is authoritative.
+# ── G-0. Stanford CoreNLP initialization (mirrors user pipeline; raise on failure) ──────────────────────────
+STANFORD_CORENLP_PATH = r'D:\MA\stanford-corenlp-4.5.7'
+JAVA_BIN_PATH = r"C:\Program Files\Java\jdk1.8.0_202\bin"
+os.environ['PATH'] = JAVA_BIN_PATH + os.pathsep + os.environ.get('PATH', '')
+_nlp = None
+try:
+    from stanfordcorenlp import StanfordCoreNLP
+    print(f"  CoreNLP path: {STANFORD_CORENLP_PATH}")
+    print(f"  Java bin    : {JAVA_BIN_PATH}")
+    _nlp = StanfordCoreNLP(STANFORD_CORENLP_PATH, lang='en')
+    print("  ✅ StanfordCoreNLP started (NER available)")
+except Exception as _e:
+    print("\n" + "!" * 70)
+    print(f"  ✗ Stanford CoreNLP failed to start: {type(_e).__name__}: {_e}")
+    print("  Module 01a.vendorNER aborted — will not silently fall back to hand-written rules.")
+    print("  Please verify: (1) stanfordcorenlp installed (2) Java 8 path correct")
+    print("           (3) stanford-corenlp-4.5.7 directory exists")
+    print("!" * 70)
+    raise
+# ── G-1. External lexicon (generated on first run; hand-editable) ─────────────────────────────────────────────────
+LEXICON_PATH = os.path.join(BASE, "data", "vendor_lexicon.csv")
+DEFAULT_LEXICON = [
+    # ── placeholders / role markers (highest priority; these are NOT company names) ──
+    ("placeholder_shareholders", r"^share\s?holders?$"),
+    ("placeholder_shareholders", r"^holders?$"),
+    ("placeholder_shareholders", r"^shareholders?\s*\(.*\)$"),
+    ("placeholder_insolvency",   r"^receivers?$"),
+    ("placeholder_insolvency",   r"\breceiver\b"),
+    ("placeholder_insolvency",   r"\badministrator\b"),
+    ("placeholder_insolvency",   r"\bliquidators?\b"),
+    ("placeholder_insolvency",   r"\btrustee\b"),
+    ("placeholder_management",   r"^management$"),
+    ("placeholder_management",   r"\bmanagement buy[- ]?out\b"),
+    ("placeholder_management",   r"\bmbo\b"),
+    # ── undisclosed ──
+    ("undisclosed", r"undisclosed"),
+    ("undisclosed", r"not disclosed"),
+    ("undisclosed", r"\bunknown\b"),
+    ("undisclosed", r"未披露"),
+    # ── PE / VC ──
+    ("pe_vc", r"capital partners?"),
+    ("pe_vc", r"private equity"),
+    ("pe_vc", r"venture capital"),
+    ("pe_vc", r"\bventures?\b"),
+    ("pe_vc", r"\bbuyout\b"),
+    ("pe_vc", r"equity partners?"),
+    ("pe_vc", r"\bKKR\b"), ("pe_vc", r"\bBain Capital\b"),
+    ("pe_vc", r"\bCarlyle\b"), ("pe_vc", r"\bCVC\b"), ("pe_vc", r"\bEQT\b"),
+    ("pe_vc", r"\bTPG\b"), ("pe_vc", r"\bPermira\b"), ("pe_vc", r"\bBlackstone\b"),
+    ("pe_vc", r"\bApollo\b"), ("pe_vc", r"\bAdvent\b"), ("pe_vc", r"\bWarburg\b"),
+    ("pe_vc", r"\bPincus\b"),
+    ("pe_vc", r"股权投资基金"), ("pe_vc", r"创业投资"),
+    ("pe_vc", r"创投"), ("pe_vc", r"投资基金"), ("pe_vc", r"私募"),
+    ("pe_vc", r"股权投资"),
+    # ── government ──
+    ("government", r"\bgovernment\b"), ("government", r"\bministry\b"),
+    ("government", r"\bmunicipal\w*\b"), ("government", r"state[- ]owned"),
+    ("government", r"\bfederal\b"), ("government", r"\bcity of\b"),
+    ("government", r"\bprovince\b"), ("government", r"\bSASAC\b"),
+    ("government", r"政府"), ("government", r"国有"),
+    ("government", r"国资"), ("government", r"财政"),
+    ("government", r"国资委"), ("government", r"人民政府"),
+    # ── financial institutions ──
+    ("financial_inst", r"\bbank\b"), ("financial_inst", r"\bbancorp\b"),
+    ("financial_inst", r"\binsurance\b"), ("financial_inst", r"\bassurance\b"),
+    ("financial_inst", r"\bsecurities\b"), ("financial_inst", r"\btrust\b"),
+    ("financial_inst", r"asset management"),
+    ("financial_inst", r"银行"), ("financial_inst", r"保险"),
+    ("financial_inst", r"证券"), ("financial_inst", r"信托"),
+    ("financial_inst", r"资产管理"),
+    # ── family / natural persons ──
+    ("family", r"\bfamily\b"), ("family", r"family[- ]owned"),
+    ("family", r"family trust"), ("family", r"家族"),
+    # ── corporate suffixes (fallback only when NER finds no entity) ──
+    ("corporate_suffix", r"\bInc\.?\b"), ("corporate_suffix", r"\bLtd\.?\b"),
+    ("corporate_suffix", r"\bLLC\b"), ("corporate_suffix", r"\bGmbH\b"),
+    ("corporate_suffix", r"\bAG\b"), ("corporate_suffix", r"\bS\.?A\.?\b"),
+    ("corporate_suffix", r"\bSAS\b"), ("corporate_suffix", r"\bN\.?V\.?\b"),
+    ("corporate_suffix", r"\bB\.?V\.?\b"), ("corporate_suffix", r"\bPLC\b"),
+    ("corporate_suffix", r"\bGroup\b"), ("corporate_suffix", r"\bHoldings?\b"),
+    ("corporate_suffix", r"\bIndustries\b"), ("corporate_suffix", r"\bCorporation\b"),
+    ("corporate_suffix", r"\bCompany\b"),
+    ("corporate_suffix", r"公司"), ("corporate_suffix", r"集团"),
+    ("corporate_suffix", r"控股"), ("corporate_suffix", r"股份"),
+    ("corporate_suffix", r"有限"),
+]
+if not os.path.exists(LEXICON_PATH):
+    pd.DataFrame(DEFAULT_LEXICON, columns=["type", "pattern"]).to_csv(
+        LEXICON_PATH, index=False, encoding="utf-8-sig")
+    print(f"  Generated default lexicon → {LEXICON_PATH}")
+    print("  ⚠ First run: review and extend rules from your sample (CSV is editable)")
+_lex = pd.read_csv(LEXICON_PATH, encoding="utf-8-sig")
+_lex = _lex.dropna(subset=["type", "pattern"])
+print(f"  Loaded lexicon: {LEXICON_PATH} ({len(_lex)} rules)")
+# Classification priority lives in code (reproducible); words live in the CSV (auditable)
+PRIORITY = [
+    "placeholder_shareholders",   # SHAREHOLDER and similar role placeholders
+    "placeholder_insolvency",     # RECEIVER - bankruptcy receivership
+    "placeholder_management",
+    "undisclosed",
+    "pe_vc",
+    "government",
+    "financial_inst",
+    "family",
+    "corporate_suffix",           # fallback only when NER fails
+]
+_LEX_DICT = {}
+for _t, _p in zip(_lex["type"], _lex["pattern"]):
+    _LEX_DICT.setdefault(_t, []).append(str(_p))
+def lex_hit(s):
+    """Return the first lexicon type matching by priority; None if no hit."""
+    for _t in PRIORITY:
+        for _p in _LEX_DICT.get(_t, []):
+            try:
+                if re.search(_p, s, flags=re.IGNORECASE):
+                    return _t
+            except re.error:
+                continue
+    return None
+# ── G-2. Run CoreNLP NER on unique vendor names (deduped; cached) ─────────────────────────────────────────
+ven_fp = os.path.join(CLEANED, "01_deal_vendor_name.csv")
+df_ven = pd.read_csv(ven_fp, low_memory=False)
+df_ven["deal_num"] = pd.to_numeric(df_ven["deal_num"], errors="coerce").astype("Int64")
+print(f"\n  Vendor table: {len(df_ven):,} deals")
+# Collect all unique vendor names
+_unique = set()
+for _s in df_ven["ven_name_all"].dropna():
+    for _x in str(_s).split("|"):
+        _x = _x.strip()
+        if _x and _x.lower() != "nan":
+            _unique.add(_x)
+_unique = sorted(_unique)
+print(f"  Unique vendor names: {len(_unique):,} → running CoreNLP NER one by one")
+_ner_cache = {}
+for _i, _nm in enumerate(_unique):
+    try:
+        _pairs = _nlp.ner(_nm)
+        _tags = [t for _, t in _pairs if t != 'O']
+        if any(t == 'PERSON' for t in _tags):
+            _et = 'PERSON'
+        elif any(t == 'ORGANIZATION' for t in _tags):
+            _et = 'ORGANIZATION'
+        elif _tags:
+            _et = _tags[0]
+        else:
+            _et = 'NONE'
+    except Exception:
+        _et = 'ERROR'
+    _ner_cache[_nm] = _et
+    if (_i + 1) % 3000 == 0:
+        print(f"      NER {_i+1:,}/{len(_unique):,}")
+_nlp.close()
+print("  ✅ NER complete, CoreNLP connection closed")
+def ner_of(nm):
+    return _ner_cache.get(nm, 'NONE')
+# ── G-3. Combined classification ───────────────────────────────────────────────────────────────
+def classify_one(s):
+    """Single vendor name -> (type, ner_type)"""
+    s = str(s).strip()
+    if not s or s.lower() == 'nan':
+        return 'missing', 'NONE'
+    _nt = ner_of(s)
+    # 1) lexicon (incl. placeholders; highest priority)
+    _lt = lex_hit(s)
+    if _lt:
+        _alias = {
+            'placeholder_shareholders': 'shareholders_undisclosed',
+            'placeholder_insolvency':   'insolvency',
+            'placeholder_management':   'management',
+            'corporate_suffix':         'corporate',
+            'family':                   'family_person',
+        }
+        return _alias.get(_lt, _lt), _nt
+    # 2) NER native capabilities
+    if _nt == 'PERSON':
+        return 'family_person', _nt
+    if _nt == 'ORGANIZATION':
+        return 'corporate', _nt
+    # 3) no determination - never silent
+    return 'UNMAPPED', _nt
+def classify_deal(name_all):
+    if pd.isna(name_all):
+        return 'missing', '', 'NONE'
+    _names = [x.strip() for x in str(name_all).split("|")
+              if x.strip() and x.strip().lower() != 'nan']
+    if not _names:
+        return 'missing', '', 'NONE'
+    _types, _ners = [], []
+    for _nm in _names:
+        _t, _nt = classify_one(_nm)
+        _types.append(_t)
+        _ners.append(_nt)
+    # Primary type: PRIORITY order; UNMAPPED / missing last
+    _rank = {t: i for i, t in enumerate(PRIORITY)}
+    _rank.update({'UNMAPPED': 99, 'missing': 100})
+    _alias_rank = {
+        'shareholders_undisclosed': _rank['placeholder_shareholders'],
+        'insolvency': _rank['placeholder_insolvency'],
+        'management': _rank['placeholder_management'],
+        'corporate': _rank['corporate_suffix'],
+        'family_person': _rank['family'],
+    }
+    _prim = min(_types, key=lambda t: _alias_rank.get(t, _rank.get(t, 99)))
+    # NER aggregation
+    if any(n == 'PERSON' for n in _ners):
+        _nt_agg = 'PERSON'
+    elif any(n == 'ORGANIZATION' for n in _ners):
+        _nt_agg = 'ORGANIZATION'
+    elif _ners:
+        _nt_agg = _ners[0]
+    else:
+        _nt_agg = 'NONE'
+    return _prim, "|".join(sorted(set(_types))), _nt_agg
+_res = df_ven["ven_name_all"].apply(classify_deal)
+df_ven["ven_type_primary"] = [r[0] for r in _res]
+df_ven["ven_type_all"]     = [r[1] for r in _res]
+df_ven["ven_ner_primary"]  = [r[2] for r in _res]
+print("\n  Vendor-type distribution (CoreNLP NER + external lexicon)")
+for k, n in df_ven["ven_type_primary"].value_counts().items():
+    print(f"    {k:<26s} {n:>8,}  ({n/len(df_ven):.1%})")
+out_ven_type = os.path.join(CLEANED, "01_deal_vendor_type.csv")
+df_ven.to_csv(out_ven_type, index=False, encoding="utf-8-sig")
+print(f"  Saved → {out_ven_type}")
+# ── G-4. UNMAPPED diagnostics (never silent; prompts rule updates) ─────────────────────────────────────────────
+_unm = df_ven[df_ven["ven_type_primary"] == 'UNMAPPED']
+print(f"\n  ⚠ UNMAPPED: {len(_unm):,} deals ({len(_unm)/len(df_ven):.1%})")
+if len(_unm):
+    _cnt = {}
+    for _s in _unm["ven_name_all"].dropna():
+        for _x in str(_s).split("|"):
+            _x = _x.strip()
+            if _x and _x.lower() != 'nan':
+                _cnt[_x] = _cnt.get(_x, 0) + 1
+    _top = sorted(_cnt.items(), key=lambda x: -x[1])[:100]
+    _dfu = pd.DataFrame(_top, columns=["vendor_name", "freq"])
+    _fp = os.path.join(CLEANED, "01_vendor_unmapped.csv")
+    _dfu.to_csv(_fp, index=False, encoding="utf-8-sig")
+    print(f"  top 20 unmapped names (full list → 01_vendor_unmapped.csv):")
+    for _nm, _f in _top[:20]:
+        print(f"      {_nm[:50]:<50s} {_f:>6,}")
+    print(f"\n  → Add rules to {LEXICON_PATH} and re-run; do not accept UNMAPPED as the final result")
+# ── G-5. Vendor type × information-environment profile ─────────────────────────────────────────────────────
+print("\n" + "=" * 70)
+print("G-5 Vendor type × information-environment profile")
+print("=" * 70)
+df_prof = df_ven.merge(deal_source_df, on="deal_num", how="left")
+df_prof = df_prof.merge(df_val[["deal_num", "deal_value"]], on="deal_num", how="left")
+_08b = os.path.join(BASE, "data", "08b_deal_firm_analysis.dta")
+if os.path.exists(_08b):
+    try:
+        _d8 = pd.read_stata(_08b, columns=["deal_num", "ln_days",
+                                           "ln_mul_rev", "num_Advisor_Submission"])
+        _d8["deal_num"] = pd.to_numeric(_d8["deal_num"], errors="coerce").astype("Int64")
+        _d8["has_adv"] = (pd.to_numeric(_d8["num_Advisor_Submission"],
+                                        errors="coerce").fillna(0) > 0).astype(int)
+        df_prof = df_prof.merge(
+            _d8[["deal_num", "ln_days", "ln_mul_rev", "has_adv"]],
+            on="deal_num", how="left")
+        print("  Merged 08b")
+    except Exception as _e:
+        print(f"  08b merge failed: {type(_e).__name__}")
+CH_COLS = [c for c in ["num_Advisor_Submission", "num_Stock_Exchange",
+                       "num_Company_Press_Release", "num_Website",
+                       "num_Electronic_Publication", "num_Miscellaneous"]
+           if c in df_prof.columns]
+EXTRA = [c for c in ["ln_days", "ln_mul_rev", "has_adv"] if c in df_prof.columns]
+print("\n  %-26s %7s %8s %8s %8s %10s" %
+      ("Vendor type", "N", "advsub", "exch", "press", "value median"))
+for t, g in df_prof.groupby("ven_type_primary"):
+    if len(g) < 20:
+        continue
+    a = g["num_Advisor_Submission"].mean() if "num_Advisor_Submission" in g else np.nan
+    e = g["num_Stock_Exchange"].mean() if "num_Stock_Exchange" in g else np.nan
+    p = g["num_Company_Press_Release"].mean() if "num_Company_Press_Release" in g else np.nan
+    dv = g["deal_value"].median() if "deal_value" in g else np.nan
+    print("  %-26s %7s %8.3f %8.3f %8.3f %10.0f" %
+          (t, f"{len(g):,}", a, e, p, dv))
+if EXTRA:
+    print("\n  %-26s %7s %9s %11s %8s" %
+          ("Vendor type", "N", "ln_days", "ln_mul_rev", "has_adv"))
+    for t, g in df_prof.groupby("ven_type_primary"):
+        if len(g) < 20:
+            continue
+        row = [t, f"{len(g):,}"]
+        for c in ["ln_days", "ln_mul_rev", "has_adv"]:
+            row.append("%.3f" % pd.to_numeric(g[c], errors="coerce").mean()
+                       if c in g.columns else "n/a")
+        print("  %-26s %7s %9s %11s %8s" % tuple(row))
+_rows = []
+for t, g in df_prof.groupby("ven_type_primary"):
+    _r = {"ven_type": t, "N": len(g)}
+    for c in CH_COLS + EXTRA:
+        if c in g.columns:
+            _r[c + "_mean"] = pd.to_numeric(g[c], errors="coerce").mean()
+    if "deal_value" in g.columns:
+        _r["deal_value_median"] = pd.to_numeric(g["deal_value"], errors="coerce").median()
+    _rows.append(_r)
+pd.DataFrame(_rows).to_csv(
+    os.path.join(CLEANED, "01_deal_vendor_type_profile.csv"),
+    index=False, encoding="utf-8-sig")
+print(f"\n  Saved → 01_deal_vendor_type_profile.csv")
+# ══ SUMMARY ═════════════════════════════════════════════════════════════════
+print("\n" + "=" * 70)
+print("SUMMARY")
+print("=" * 70)
 for label, path in [
-    ("01_deal_sic_industry.csv",   out_path_ind),
-    ("01_deal_multiples.csv",      out_path_mul),
+    ("01_deal_sic_industry.csv", out_path_ind),
+    ("01_deal_multiples.csv", out_path_mul),
     ("01_deal_structure_date.csv", out_path_sd),
-    ("01_deal_value.csv",          out_path_val),
-    ("01_deal_info_source_count.csv",    out_path_src),
+    ("01_deal_value.csv", out_path_val),
+    ("01_deal_info_source_count.csv", out_path_src),
+    ("01_deal_vendor_name.csv", os.path.join(CLEANED, "01_deal_vendor_name.csv")),
+    ("01_deal_vendor_type.csv", out_ven_type),
+    ("01_deal_vendor_type_profile.csv",
+     os.path.join(CLEANED, "01_deal_vendor_type_profile.csv")),
 ]:
-    size_kb = os.path.getsize(path) / 1024
-    print(f"  {label:<30s} {size_kb:>8.0f} KB")
-
-print("\nAll cleaned files saved to data/cleaned/")
+    if os.path.exists(path):
+        print(f"  {label:<34s} {os.path.getsize(path)/1024:>8.0f} KB")
+#（注：内容由AI生成）
