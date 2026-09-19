@@ -268,7 +268,7 @@ log(f"  Rows with text_pool_rolling_count >= 10: "
     f"{(df['text_pool_rolling_count'] >= 10).sum():,}")
 
 # ════════════════════════════════════════════════════════════════════════════
-# 3. Sequential filters 【核心6条严格按你指定顺序；后续为补充筛选】
+# 3. Sequential filters [core 6 in specified order; additional filters follow]
 # ════════════════════════════════════════════════════════════════════════════
 log("\n" + "=" * 70)
 log("STEP 3 — Sequential filters (aligned with empirical_design sample table)")
@@ -278,7 +278,7 @@ log(f"\nInput: {INPUT_ROWS:,} rows")
 filter_summary.append(("Input", 0, INPUT_ROWS))
 
 # --------------------------
-# 【前置定义提取股权函数】
+# [Pre-definition: equity extraction function]
 # --------------------------
 def infer_stake_from_deal_type(deal_type_str):
     """Extract max percentage from deal_type string; return NaN if none found."""
@@ -318,17 +318,50 @@ keep4 = df["deal_value"] >= 1000
 df = apply_filter(df, keep4,
     "Filter 4 (deal_value >= USD 1M)")
 
-# ── Filter 5: deal_status Completed / Completed Assumed ───────────────────
-keep5 = df["deal_status"].isin(["Completed", "Completed Assumed"])
-df = apply_filter(df, keep5,
-    "Filter 5 (deal_status = Completed/Completed Assumed)")
+# ── Filter 5: deal_status Completed / Completed Assumed ─────260906 removed──────────────
+# ★ Never applied: main sample must retain non-completed observations, otherwise completion probability equation has no variation.
+#   Unknown outcomes (Announced / Pending / Postponed) keep original values, never filled as 0 (failed).
+#keep5 = df["deal_status"].isin(["Completed", "Completed Assumed"])
+#df = apply_filter(df, keep5,
+    #"Filter 5 (deal_status = Completed/Completed Assumed)")
 
-# ── Filter 6: tar/acq SIC3 & country code both available ───────────────────
+# ── Filter 7: tar/acq SIC3 & country code both available ───────────────────
 keep7 = (df["tar_sic3"].notna() & df["acq_sic3"].notna() &
          df["tar_country_code"].notna() & df["acq_country_code"].notna())
 df = apply_filter(df, keep7,
     "Filter 7 (tar/acq SIC3 & country code all available)")
 
+# ══ Below are overall definitions at the [research design] level ══
+# Order aligns with Table 1: first derive analysis file (19,745), then apply listing status and purity constraints.
+# Filters are commutative; reordering does not change final N, only Table 1 stepwise presentation.
+
+# ── Filter 8: acq_listed = 1   (Table 1 step 10) ──────────────────────────
+if "acq_listed" in df.columns and df["acq_listed"].notna().any():
+    keep8 = pd.to_numeric(df["acq_listed"], errors="coerce") == 1
+    df = apply_filter(df, keep8, "Filter 8 (acq_listed = 1)")
+else:
+    log("  [skip] Filter 8: no acq_listed column in 04b (or all null)")
+
+# ── Filter 9: tar_listed = 0   (Table 1 step 11) ──────────────────────────
+if "tar_listed" in df.columns and df["tar_listed"].notna().any():
+    keep9 = pd.to_numeric(df["tar_listed"], errors="coerce") == 0
+    df = apply_filter(df, keep9, "Filter 9 (tar_listed = 0)")
+else:
+    log("  [skip] Filter 9: no tar_listed column in 04b (or all null)")
+
+# -- Filter 10: drop public-offer structures (Table 1 step 12) --
+# Public offers can only target listed targets; drop to avoid residual targets that "delisted after deal"
+PUB_STRUCT = ["public takeover", "scheme of arrangement", "recommended bid",
+              "hostile bid", "contested bid", "tender", "takeover"]
+_struct_col = next((c for c in ["deal_struct_all", "deal_struct"]
+                    if c in df.columns), None)
+if _struct_col is not None:
+    _s = df[_struct_col].astype(str).str.strip().str.lower()
+    df = apply_filter(df, ~_s.apply(lambda x: any(p in x for p in PUB_STRUCT)),
+        "Filter 10 (drop public-offer structures)")
+else:
+    log("  [skip] Filter 10: no deal_struct column in 04b")
+    
 # ════════════════════════════════════════════════════════════════════════════
 # 4. Post-filter variable construction
 # ════════════════════════════════════════════════════════════════════════════
@@ -370,12 +403,163 @@ log(f"cross_border: domestic=0: {n_dom:,}  "
     f"cross_border=1: {n_cb:,}  NaN: {df['cross_border'].isna().sum():,}")
 
 # 4.4 cash: 1 if deal_pay_method contains "cash" (case-insensitive)
-df["cash"] = (
-    df["deal_pay_method"].str.lower().str.contains("cash", na=False).astype(int)
+#df["cash"] = (
+   # df["deal_pay_method"].str.lower().str.contains("cash", na=False).astype(int)
+#)
+#n_noncash = int((df["cash"] == 0).sum())
+#n_cash    = int((df["cash"] == 1).sum())
+#log(f"cash: non-cash/unknown=0: {n_noncash:,}  includes-cash=1: {n_cash:,}")
+
+# ══ 4.4 Payment method dummies (rewritten 2026-09-07) ══════════════════════════════════
+# Source: 01a Module C, pipe-separated set aggregated [before] deal_num dedup.
+# Background: Zephyr one payment method per row; mixed payment (Cash|Shares) spans multiple rows;
+#       old keep-first dedup silently dropped the second row. Empirical share-exchange rate was underestimated
+#       13.4% -> 18.6% (share-exchange info for 2,238 deals was dropped).
+#
+# Design: first merge by category (Cash and Cash Reserves both cash, not mixed),
+#       then determine pure/mixed. If judged by value count directly, 3,244 Cash|Cash Reserves
+#       would be misclassified as mixed payment, severely underestimating pure cash group.
+PAY_SRC = "deal_pay_method_all"
+if PAY_SRC not in df.columns:
+    raise ValueError(
+        f"Missing {PAY_SRC}. Please rerun 01a_clean_deal_modules.py -- this column is generated in Module C "
+        f"before dedup, aggregated by deal_num, to fix mixed payment methods dropped by keep-first "
+        f"dedup.")
+
+# Value -> category (covers all 15 values observed in 01a)
+PAY_CLASS_MAP = {
+    # Cash
+    "Cash":               "cash",
+    "Cash Reserves":      "cash",
+    # Equity -- key group triggering securities review
+    "Shares":             "shares",
+    "Third party shares": "shares",
+    # Debt
+    "Liabilities":        "debt",
+    "Converted Debt":     "debt",
+    "Bonds":              "debt",
+    # Other / deferred
+    "Deferred payment":   "other",
+    "Earn-out":           "other",
+    "Business assets":    "other",
+    "Dividend":           "other",
+    "Services":           "other",
+    "Other":              "other",
+    "Cash assumed":       "other",   # Assume target cash, semantically ambiguous, conservatively other
+}
+
+_unmapped = set()
+
+def _to_classes(s):
+    """'Cash|Shares' -> {'cash','shares'}; unmapped values go to _unmapped for reporting."""
+    if pd.isna(s) or not str(s).strip():
+        return frozenset()
+    out = set()
+    for v in (x.strip() for x in str(s).split("|")):
+        if not v:
+            continue
+        c = PAY_CLASS_MAP.get(v)
+        if c is None:
+            _unmapped.add(v)
+        else:
+            out.add(c)
+    return frozenset(out)
+
+_ps = df[PAY_SRC].apply(_to_classes)
+
+if _unmapped:
+    log(f"\n  WARNING: unmapped payment method values {len(_unmapped)}: {sorted(_unmapped)}")
+    log(f"     Please add to PAY_CLASS_MAP and rerun, otherwise these deals fall into wrong category")
+
+# -- Non-exclusive: contains any category --
+df["pay_has_cash"]   = _ps.apply(lambda c: int("cash"   in c))
+df["pay_has_shares"] = _ps.apply(lambda c: int("shares" in c))
+df["pay_has_debt"]   = _ps.apply(lambda c: int("debt"   in c))
+df["pay_has_other"]  = _ps.apply(lambda c: int("other"  in c))
+df["pay_n_class"]    = _ps.apply(len)          # 1=pure, >1=mixed, 0=no record
+
+# -- Mutually exclusive complete set: 6 dummies sum to 1 --
+df["pay_pure_cash"]   = _ps.apply(lambda c: int(c == {"cash"}))
+df["pay_pure_shares"] = _ps.apply(lambda c: int(c == {"shares"}))
+df["pay_pure_debt"]   = _ps.apply(lambda c: int(c == {"debt"}))
+df["pay_pure_other"]  = _ps.apply(lambda c: int(c == {"other"}))
+df["pay_mix"]         = _ps.apply(lambda c: int(len(c) > 1))
+df["pay_unknown"]     = _ps.apply(lambda c: int(len(c) == 0))
+
+# -- Mixed payment breakdown (coexists with pay_mix, can be used together) --
+df["pay_mix_cash_shares"] = _ps.apply(lambda c: int(c == {"cash", "shares"}))
+df["pay_mix_with_shares"] = _ps.apply(lambda c: int(len(c) > 1 and "shares" in c))
+df["pay_mix_with_cash"]   = _ps.apply(lambda c: int(len(c) > 1 and "cash"   in c))
+df["pay_mix_with_debt"]   = _ps.apply(lambda c: int(len(c) > 1 and "debt"   in c))
+
+# -- Mutually exclusive category labels (C(pay_class) convenient in regression, base group = cash) --
+df["pay_class"] = np.select(
+    [df["pay_unknown"] == 1,
+     df["pay_pure_cash"] == 1,
+     df["pay_pure_shares"] == 1,
+     df["pay_pure_debt"] == 1,
+     df["pay_pure_other"] == 1],
+    ["unknown", "cash", "shares", "debt", "other"],
+    default="mix"
 )
-n_noncash = int((df["cash"] == 0).sum())
-n_cash    = int((df["cash"] == 1).sum())
-log(f"cash: non-cash/unknown=0: {n_noncash:,}  includes-cash=1: {n_cash:,}")
+
+# -- Check: must be complete set and mutually exclusive --
+_chk = df[["pay_pure_cash", "pay_pure_shares", "pay_pure_debt",
+           "pay_pure_other", "pay_mix", "pay_unknown"]].sum(axis=1)
+if not (_chk == 1).all():
+    raise ValueError(f"Payment method dummies do not form complete set ({int((_chk != 1).sum())} abnormal rows)")
+
+log("\n" + "=" * 66)
+log("Payment method distribution (category level, merge first then pure/mixed)")
+log("=" * 66)
+log(f"  Sample N={len(df):,}")
+log("")
+
+# -- Safe column access: some derived variables not yet generated at stage 05 (e.g. tar_china derived in 08b) --
+#    Note: pd.to_numeric(None, errors="coerce") does not error, returns nan scalar,
+#    scalar has no .fillna, so must check column existence first.
+def _num_or_zero(name):
+    if name in df.columns:
+        return pd.to_numeric(df[name], errors="coerce").fillna(0)
+    return pd.Series(0.0, index=df.index)
+
+_has_sec = "reg_securities" in df.columns
+# At stage 05 tar_china not yet derived, fall back to computing from acq/tar country code
+if "tar_china" in df.columns:
+    _cn = _num_or_zero("tar_china")
+elif "tar_country_code" in df.columns:
+    _cn = df["tar_country_code"].astype(str).str.upper().eq("CN").astype(float)
+    log("  [note] tar_china not derived, China% computed from tar_country_code=='CN'")
+else:
+    _cn = pd.Series(0.0, index=df.index)
+    log("  [note] no tar_china / tar_country_code, China% column = 0")
+
+_rs = _num_or_zero("reg_securities")
+
+log(f"  {'Category':<10s}{'N':>9s}{'Pct':>8s}"
+    + (f"{'SecReview%':>11s}" if _has_sec else "")
+    + f"{'China%':>9s}")
+for _k in ["cash", "shares", "debt", "other", "mix", "unknown"]:
+    _m = (df["pay_class"] == _k)
+    if _m.sum() == 0:
+        continue
+    _line = f"  {_k:<10s}{int(_m.sum()):>9,}{_m.mean():>7.1%}"
+    if _has_sec:
+        _line += f"{_rs[_m].mean():>10.1%}"
+    _line += f"{_cn[_m].mean():>8.1%}"
+    log(_line)
+
+log("")
+log(f"  Share exchange (shares class, incl. mixed): {df['pay_has_shares'].mean():>6.1%}"
+    f"   <- old dedup method was only 13.4%")
+log(f"  Cash                      : {df['pay_has_cash'].mean():>6.1%}")
+log(f"  Debt assumption           : {df['pay_has_debt'].mean():>6.1%}")
+log(f"  Mixed payment             : {df['pay_mix'].mean():>6.1%}")
+log(f"  of which cash+shares      : {df['pay_mix_cash_shares'].mean():>6.1%}")
+log(f"  No payment record         : {df['pay_unknown'].mean():>6.1%}"
+    f"   <- needs discussion in main text")
+log("=" * 66)
+# ══ 4.4 Payment method dummies (rewritten 2026-09-07) end══════════════════════════════════
 
 # tar_overview_wordcount already computed in §2.1; retained in output.
 # _row_id retained in output (useful for debugging; drop before Stata if preferred).
@@ -413,7 +597,7 @@ log("=" * 70)
 
 FILTER_DISPLAY = {
     "Filter 1 (sample period 2000–2024)":
-        "Filter 1  (sample period 2000–2024)",
+        "Filter 1  (sample period 2000-2024)",
     "Filter 2 (deal_type starts with Acquisition)":
         "Filter 2  (deal_type starts with Acquisition)",
     "Filter 3 (stake_acq_pct >= 50%, impute from deal_type if missing)":
@@ -422,10 +606,16 @@ FILTER_DISPLAY = {
         "Filter 4  (deal_value >= USD 1M)",
     "Filter 5 (deal_status = Completed/Completed Assumed)":
         "Filter 5  (deal_status = Completed/Completed Assumed)",
-    "Filter 76 (tar/acq SIC3 & country code all available)":
+    "Filter 7 (tar/acq SIC3 & country code all available)":
         "Filter 7  (tar/acq SIC3 & country code all available)",
+    "Filter 8 (acq_listed = 1)":
+        "Filter 8  (acq_listed = 1)",
+    "Filter 9 (tar_listed = 0)":
+        "Filter 9  (tar_listed = 0)",
+    "Filter 10 (drop public-offer structures)":
+        "Filter 10 (drop public-offer structures)",
 }
-
+    
 log_text_lines = [
     "=== SAMPLE FILTER LOG ===",
     f"Input  : 04b_deal_firm_country.csv  {INPUT_ROWS:,} rows",
@@ -481,3 +671,4 @@ log(f"Output file size: {out_size:,} bytes "
     f"({'OK' if out_size > 0 else 'EMPTY — ERROR'})")
 
 log("\nScript 05 complete.")
+
