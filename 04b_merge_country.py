@@ -249,10 +249,10 @@ if "announced_d_yr" in df.columns:
 else:
     log(f"  M1: announced_d_yr column not found — no fallback applied")
 
-# 目标国家的merge key
+# Target country merge key
 df["_merge_cc_tar"] = df["tar_country_code"].astype(str).str.strip()
 
-# 收购方国家的merge key
+# Acquirer country merge key
 df["_merge_cc_acq"] = df["acq_country_code"].astype(str).str.strip()
 
 log(f"completed_d_yr non-missing: {df['_merge_year'].notna().sum():,} "
@@ -279,7 +279,7 @@ log("=" * 60)
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# 3.1 目标国家的 stock_traded_gdp
+# 3.1 Target country stock_traded_gdp
 # ────────────────────────────────────────────────────────────────────────────
 df_ctry_tar = df_ctry.rename(columns={
     "country_code": "_merge_cc_tar",
@@ -306,7 +306,7 @@ log(f"stock_traded_gdp_tar non-missing: {n_tar_matched:,} / {BASE_ROWS:,} "
     f"({n_tar_matched/BASE_ROWS*100:.1f}%)")
 
 # ────────────────────────────────────────────────────────────────────────────
-# 3.2 收购方国家的 stock_traded_gdp
+# 3.2 Acquirer country stock_traded_gdp
 # ────────────────────────────────────────────────────────────────────────────
 df_ctry_acq = df_ctry.rename(columns={
     "country_code": "_merge_cc_acq",
@@ -333,7 +333,7 @@ log(f"stock_traded_gdp_acq non-missing: {n_acq_matched:,} / {BASE_ROWS:,} "
     f"({n_acq_matched/BASE_ROWS*100:.1f}%)")
 
 # ────────────────────────────────────────────────────────────────────────────
-# 3.3 清理临时列
+# 3.3 Clean up temporary columns
 # ────────────────────────────────────────────────────────────────────────────
 df = df.drop(columns=[
     "_merge_year_tar", "_merge_cc_tar",
@@ -341,23 +341,20 @@ df = df.drop(columns=[
     "_merge_year"
 ])
 
-# 向后兼容：原有的 stock_traded_gdp 指向目标国家
+# Backward compatibility: original stock_traded_gdp points to target country
 #df["stock_traded_gdp"] = df["stock_traded_gdp_tar"]
 
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 4. Diagnostics
-# ════════════════════════════════════════════════════════════════════════════
-# ════════════════════════════════════════════════════════════════════════════
-# 4. Diagnostics — 分别诊断tar和acq的匹配情况
+# 4. Diagnostics — separately diagnose tar and acq match quality
 # ════════════════════════════════════════════════════════════════════════════
 log("\n" + "=" * 60)
 log("STEP 4 — Diagnostics: tar vs acq match quality")
 log("=" * 60)
 
 # ────────────────────────────────────────────────────────────────────────────
-# 4.1 目标国家的匹配诊断
+# 4.1 Target country match diagnostics
 # ────────────────────────────────────────────────────────────────────────────
 df_tmp_tar = df.copy()
 df_tmp_tar["_yr"] = pd.to_numeric(df_tmp_tar.get("completed_d_yr", pd.Series(dtype=float)),
@@ -372,7 +369,7 @@ log(f"\n--- Target country stock_traded_gdp_tar ---")
 log(f"  completed_d_yr missing: {n_miss_yr_tar:,}")
 log(f"  tar_country_code missing: {n_no_ctry_tar:,}")
 
-# 未映射国家
+# Unmapped countries
 all_deal_ccs_tar = set(df_tmp_tar["_cc"].dropna().unique())
 mapped_ccs = set(COUNTRY_MAP.values())
 unmapped_tar = all_deal_ccs_tar - mapped_ccs - {"nan"}
@@ -390,7 +387,7 @@ for cc in top_cc_tar:
     log(f"    {cc:<6s}: {n_hit:>5,} / {len(sub):>5,} ({n_hit/len(sub)*100:5.1f}%)")
 
 # ────────────────────────────────────────────────────────────────────────────
-# 4.2 收购方国家的匹配诊断
+# 4.2 Acquirer country match diagnostics
 # ────────────────────────────────────────────────────────────────────────────
 df_tmp_acq = df.copy()
 df_tmp_acq["_yr"] = pd.to_numeric(df_tmp_acq.get("completed_d_yr", pd.Series(dtype=float)),
@@ -421,7 +418,7 @@ for cc in top_cc_acq:
     log(f"    {cc:<6s}: {n_hit:>5,} / {len(sub):>5,} ({n_hit/len(sub)*100:5.1f}%)")
 
 # ────────────────────────────────────────────────────────────────────────────
-# 4.3 汇总统计
+# 4.3 Summary statistics
 # ────────────────────────────────────────────────────────────────────────────
 log(f"\n--- Summary statistics ---")
 s_tar = df["stock_traded_gdp_tar"].dropna()
@@ -429,7 +426,7 @@ s_acq = df["stock_traded_gdp_acq"].dropna()
 log(f"  stock_traded_gdp_tar: n={len(s_tar):,} | mean={s_tar.mean():.2f} | median={s_tar.median():.2f}")
 log(f"  stock_traded_gdp_acq: n={len(s_acq):,} | mean={s_acq.mean():.2f} | median={s_acq.median():.2f}")
 
-# 中国覆盖警告
+# China coverage warning
 log(f"\n--- China coverage ---")
 _cn_tar_total = (df["tar_country_code"] == "CN").sum()
 _cn_tar_hit = ((df["tar_country_code"] == "CN") & df["stock_traded_gdp_tar"].notna()).sum()
@@ -440,51 +437,51 @@ log(f"  CN as target: {_cn_tar_hit:,}/{_cn_tar_total:,} matched ({_cn_tar_hit/ma
 log(f"  CN as acquirer: {_cn_acq_hit:,}/{_cn_acq_total:,} matched ({_cn_acq_hit/max(_cn_acq_total,1)*100:.1f}%)")
 
 # ────────────────────────────────────────────────────────────────────────────
-# 4.4 校验：标的&收购方国家一致时，两国股市指标应相等
+# 4.4 Consistency check: when target and acquirer countries match, stock market indicators should be equal
 # ────────────────────────────────────────────────────────────────────────────
 log(f"\n--- Consistency Check: tar_country_code == acq_country_code ---")
-# 筛选买卖双方同国样本
+# Filter same-country deals
 same_cc_mask = (df["tar_country_code"].notna()) & (df["acq_country_code"].notna())
 same_cc_mask = same_cc_mask & (df["tar_country_code"] == df["acq_country_code"])
 df_same_cc = df[same_cc_mask].copy()
 n_same_cc_total = len(df_same_cc)
-log(f"买卖双方同国交易总样本数：{n_same_cc_total:,}")
+log(f"Same-country deals total: {n_same_cc_total:,}")
 
-# 双方指标均不为空的子样本（才可对比差值）
+# Subsample where both indicators are non-null (needed for diff comparison)
 both_notna_mask = df_same_cc["stock_traded_gdp_tar"].notna() & df_same_cc["stock_traded_gdp_acq"].notna()
 df_compare = df_same_cc[both_notna_mask].copy()
 n_compare = len(df_compare)
-log(f"同国且两国股市指标均非空样本：{n_compare:,}")
+log(f"Same-country deals with both indicators non-null: {n_compare:,}")
 
-# 计算差值，判定不一致（浮点误差容忍0.0001）
+# Compute diff, flag inconsistency (float tolerance 0.0001)
 df_compare["gdp_diff"] = abs(df_compare["stock_traded_gdp_tar"] - df_compare["stock_traded_gdp_acq"])
 inconsistent_mask = df_compare["gdp_diff"] > 1e-4
 df_inconsistent = df_compare[inconsistent_mask].copy()
 n_inconsistent = len(df_inconsistent)
 consistent_rate = ((n_compare - n_inconsistent) / n_compare * 100) if n_compare > 0 else 100
 
-log(f"指标不一致样本数量：{n_inconsistent:,} | 一致率：{consistent_rate:.2f}%")
+log(f"Inconsistent samples: {n_inconsistent:,} | consistency rate: {consistent_rate:.2f}%")
 
 if n_inconsistent > 0:
-    log(f"\n【警告】存在买卖双方同国但股市指标不匹配交易，前20条明细：")
+    log(f"\nWARNING: same-country deals with mismatched stock indicators, first 20 rows:")
     show_cols = ["_row_id", "tar_country_code", "acq_country_code",
                  "stock_traded_gdp_tar", "stock_traded_gdp_acq", "gdp_diff",
                  "completed_d_yr", "_year_source"]
     sample_show = df_inconsistent[show_cols].head(20)
     log(sample_show.to_string(index=False))
 
-    # 统计不匹配国家分布
+    # Count mismatch distribution by country
     cc_bad_cnt = df_inconsistent["tar_country_code"].value_counts()
-    log(f"\n不匹配样本分国家统计：")
+    log(f"\nMismatch samples by country:")
     for cc, cnt in cc_bad_cnt.items():
-        log(f"    {cc}: {cnt:,} 条")
+        log(f"    {cc}: {cnt:,} rows")
 else:
-    log(f"✅ 所有买卖双方同国交易，股市指标完全匹配，无逻辑冲突")
+    log(f"All same-country deals have matching stock indicators, no logical conflict")
 
-# 统计同国但至少一方指标缺失样本
+# Count same-country deals where at least one indicator is missing
 missing_one = df_same_cc[~both_notna_mask]
 n_missing_one = len(missing_one)
-log(f"\n同国但标的/收购方股市指标至少一方缺失样本：{n_missing_one:,}")
+log(f"\nSame-country deals with at least one missing indicator: {n_missing_one:,}")
 
 # ════════════════════════════════════════════════════════════════════════════
 # 5. Save outputs
@@ -518,3 +515,4 @@ with open(diag_path, "w", encoding="utf-8") as f:
 log(f"Saved -> {diag_path}")
 
 log("\nScript 04b complete.")
+
