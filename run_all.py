@@ -21,6 +21,7 @@ STEPS = [
     "01a_clean_deal_modules",
     "01b_clean_deal_overview",
     "01c_clean_deal_comments",
+    "01d_vendor_identity",
     "02_merge_deal_master",
     "03_clean_firm_modules",
     "04a_merge_firm_to_deal",
