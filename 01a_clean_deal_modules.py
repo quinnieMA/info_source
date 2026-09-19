@@ -673,4 +673,4 @@ for label, path in [
 ]:
     if os.path.exists(path):
         print(f"  {label:<34s} {os.path.getsize(path)/1024:>8.0f} KB")
-#（注：内容由AI生成）
+
