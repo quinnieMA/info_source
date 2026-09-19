@@ -148,7 +148,7 @@ def clean_missing(df):
         df[col] = df[col].replace(MISSING_VALS, np.nan).str.strip()
     return pd.DataFrame(df)
 
-# Orbis ID 单值处理函数
+# Orbis ID single-value processing function
 def fix_orbis_val(val):
     if pd.isna(val):
         return np.nan
@@ -159,11 +159,11 @@ def fix_orbis_val(val):
         return np.nan
     return s.zfill(9)
 
-# 仅接收单列Series，逐元素转换
+# Accepts a single-column Series, converts element-wise
 def normalize_orbis_id(ser):
     return ser.apply(fix_orbis_val)
 
-# 监管分类常量不变
+# Regulatory classification constants unchanged
 REG_CATEGORY_KEYWORDS = {
     "antitrust": [
         "competition", "antitrust","anti-trust","anti-monopoly", "antimonopoly",
@@ -253,8 +253,8 @@ CIVIL_LAW_COUNTRIES = {
 TRANSNATIONAL_REGULATORS = {"European Union", "EU", "European Commission"}
 
 # ════════════════════════════════════════════════════════════════════════════
-# 精确机构名映射（2026-09-06，基于 443 个唯一机构名全量枚举）
-# 优先级：精确映射 > 排除清单 > 关键词兜底
+# Exact agency name mapping (2026-09-06, based on full enumeration of 443 unique agency names)
+# Priority: exact mapping > exclusion list > keyword fallback
 # ════════════════════════════════════════════════════════════════════════════
 
 REG_EXCLUDE = {
@@ -275,15 +275,15 @@ REG_TRANSNATIONAL_BODIES = {
 }
 
 REG_EXACT_MAP = {
-    # ── 中国：银行业监管明确排除出 securities ──
+    # -- China: banking regulation explicitly excluded from securities --
     "china banking and insurance regulatory commission": {"financial"},
     "cbirc":                                      {"financial"},
     "cbrc":                                       {"financial"},
-    # ── 综合金融监管：归 financial，不归 securities ──
+    # -- Comprehensive financial regulator: classified as financial, not securities --
     "financial regulatory authority":             {"financial"},
     "guernsey financial services commission":     {"financial"},
     "jersey financial services commission":       {"financial"},
-    # ── 中国 ──
+    # -- China --
     "ministry of commerce":                       {"foreign_invest"},
     "national development and reform commission": {"state_assets"},
     "state administration of foreign exchange":   {"foreign_invest"},
@@ -292,9 +292,9 @@ REG_EXACT_MAP = {
     "national administration of financial regulation": {"financial"},
     "china's state council":                      {"state_assets"},
     "state council":                              {"state_assets"},
-    # ── 超国家 ──
+    # -- Supranational --
     "european commission":                        {"antitrust"},
-    # ── 反垄断 ──
+    # -- Antitrust --
     "anti-trust authority":                       {"antitrust"},
     "comisión nacional de la competencia":        {"antitrust"},
     "comision nacional de los mercados y la competencia": {"antitrust"},
@@ -307,7 +307,7 @@ REG_EXACT_MAP = {
     "lietuvos respublikos konkurencijos taryba":  {"antitrust"},
     "commerce commission":                        {"antitrust"},
     "illinois commerce commission":               {"antitrust"},
-    # ── 证券 ──
+    # -- Securities --
     "consob":                                     {"securities"},
     "comision nacional del mercado de valores":   {"securities"},
     "komisija za hartije od vrjednosti":          {"securities"},
@@ -329,7 +329,7 @@ REG_EXACT_MAP = {
     "comissão de valores mobiliários":            {"securities"},
     "comissão do mercado de valores mobiliários": {"securities"},
     "autorité des services et marchés financiers": {"securities"},
-    # ── 金融/央行 ──
+    # -- Financial / central bank --
     "bank negara malaysia":                       {"financial"},
     "federal reserve board":                      {"financial"},
     "bank of italy":                              {"financial"},
@@ -339,17 +339,17 @@ REG_EXACT_MAP = {
     "nepal rastra bank":                          {"financial"},
     "federal energy regulatory commission":       {"financial"},
     "prudential regulation authority":            {"financial"},
-    # ── 外资 ──
+    # -- Foreign investment --
     "overseas investment office":                 {"foreign_invest"},
     "ministry of international trade and industry": {"foreign_invest"},
     "ministry of economic affairs":               {"foreign_invest"},
-    # ── 行业 ──
+    # -- Sectoral --
     "agência nacional de energia elétrica":       {"financial"},
     "agência nacional de telecomunicações":       {"defense_tech"},
     "federal communications commission":          {"defense_tech"},
-    # ── 第三轮：补剩余漏网 ──
-    "kilpailuvirasto":                            {"antitrust"},   # 芬兰竞争局
-    "australian prudential regulatory authority": {"financial"},   # 澳审慎监管局
+    # -- Third round: fill remaining gaps --
+    "kilpailuvirasto":                            {"antitrust"},   # Finnish Competition Authority
+    "australian prudential regulatory authority": {"financial"},   # Australian Prudential Regulation Authority
     "australian prudential regulation authority": {"financial"},
     "bureau of internal revenue":                 {"financial"},
     "ministry of domestic trade and consumer affairs": {"financial"},
@@ -357,34 +357,34 @@ REG_EXACT_MAP = {
 }
 
 def _norm(s):
-    """标准化机构名：小写 + 压缩空白"""
+    """Normalize agency name: lowercase + collapse whitespace"""
     return " ".join(str(s).lower().split())
 
 def classify_regulatory_category(body_name):
     """
-    精确映射优先 → 排除清单 → 关键词兜底
+    Exact mapping first -> exclusion list -> keyword fallback
     """
     if pd.isna(body_name):
         return set()
     raw = str(body_name).strip()
     nm  = _norm(raw)
 
-    # ① 精确映射（最高优先级，直接返回）
+    # (1) Exact mapping (highest priority, direct return)
     for frag, cats in REG_EXACT_MAP.items():
         if _norm(frag) in nm:
             return set(cats)
 
-    # ② 排除清单（交易所自律组织/法院，不算监管审批）
+    # (2) Exclusion list (exchange self-regulatory bodies / courts, not regulatory approvals)
     for bad in REG_EXCLUDE:
         if _norm(bad) in nm:
             return set()
 
-    # ③ 关键词兜底；短缩写加词边界，防 "sec"/"amb"/"nma" 误伤
+    # (3) Keyword fallback; short abbreviations use word boundaries to avoid false matches
     cats = set()
     for cat, keywords in REG_CATEGORY_KEYWORDS.items():
         for kw in keywords:
             kwl = kw.lower()
-            if len(kwl) <= 4:                      # 短缩写必须全词匹配
+            if len(kwl) <= 4:                      # Short abbreviations require whole-word match
                 if re.search(rf"\b{re.escape(kwl)}\b", nm):
                     cats.add(cat)
                     break
@@ -424,7 +424,7 @@ def build_regulatory_variables(df_full_raw):
             lambda bodies: any(cat in classify_regulatory_category(b) for b in bodies.split("|") if b)
         ).astype(int)
     def _is_transnational_body(bodies_str):
-        """任一机构名匹配跨国名单即算跨国监管"""
+        """Any agency name matching the transnational list counts as cross-national regulation"""
         parts = [p.strip() for p in str(bodies_str).split("|") if p.strip()]
         return any(any(_norm(t) in _norm(p) for t in REG_TRANSNATIONAL_BODIES)
                    for p in parts)
@@ -444,9 +444,9 @@ def build_regulatory_variables(df_full_raw):
     ).astype(int)
     reg_agg["reg_mixed_legal"] = ((reg_agg["reg_common_law"] == 1) & (reg_agg["reg_civil_law"] == 1)).astype(int)
     return reg_agg
-# ==================== 主程序 ====================
+# ==================== Main program ====================
 print("============================================================")
-print("MODULE E — Overview + Country (Fix Series ValueError)")
+print("MODULE 01b.overview_country — Overview + Country (Fix Series ValueError)")
 print("============================================================")
 
 ovw_files = sorted(glob.glob(os.path.join(RAW_OVW, "acquisition_overview_*_cleaned.csv")))
@@ -476,47 +476,47 @@ for fp in ovw_files:
     batches.append(df_b)
     print(f"  {batch_name}: {n_raw} rows read, {len(dup_cols)} __1 cols dropped")
 
-# 1. 全部原始数据拼接，不做任何去重
+# 1. Concatenate all raw data, no deduplication
 df_full_raw = pd.concat(batches, ignore_index=True)
 print(f"\nFull raw stacked rows (before dedup): {len(df_full_raw):,}")
 
-# 2. 【强制先聚合监管指标，满足先count再去重要求】
+# 2. [Mandatory] Aggregate regulatory indicators first (count before dedup requirement)
 print("\n============================================================")
-print("Building regulatory variables from full raw data (all reg rows reserved)")
+print("MODULE 01b.reg Building regulatory variables from full raw data (all reg rows reserved)")
 print("============================================================")
 reg_vars = build_regulatory_variables(df_full_raw)
 
-# 3. 复制原始表，开始清洗逻辑
+# 3. Copy raw table, start cleaning logic
 df_ovw = df_full_raw.copy()
 
-# 【核心修复】循环内传入单列Series，不再传整张DataFrame
+# [Core fix] Pass single-column Series inside loop, not the full DataFrame
 for _oc in ["tar_orbis_id_num", "acq_orbis_id_num"]:
     if _oc in df_ovw.columns:
         df_ovw[_oc] = normalize_orbis_id(df_ovw[_oc])
 
-# 过滤无标的空行
+# Drop rows with no target
 n_before_filter = len(df_ovw)
 df_ovw = df_ovw[df_ovw["tar_name"].notna()].copy()
 print(f"Drop blank tar_name rows: {n_before_filter - len(df_ovw):,} removed")
 
-# 按deal_num+标的唯一键去重
+# Deduplicate by deal_num + target unique key
 df_ovw["_tar_key"] = df_ovw["tar_bvd_id_num"].fillna(df_ovw["tar_name"])
 n_before_dedup = len(df_ovw)
 df_ovw = df_ovw.drop_duplicates(subset=["deal_num", "_tar_key"], keep="first")
 df_ovw = df_ovw.drop(columns=["_tar_key"])
 print(f"Deduplicate (deal_num+tar_key): {n_before_dedup - len(df_ovw):,} duplicates dropped")
 
-# deal_num 数值转换
+# Convert deal_num to numeric
 df_ovw["deal_num"] = pd.to_numeric(df_ovw["deal_num"], errors="coerce")
 df_ovw = df_ovw[df_ovw["deal_num"].notna()]
 df_ovw["deal_num"] = df_ovw["deal_num"].astype("Int64")
 
-# 交易金额重命名
+# Rename deal value
 if "deal_value" in df_ovw.columns:
     df_ovw["deal_value_ovw"] = pd.to_numeric(df_ovw["deal_value"], errors="coerce")
     df_ovw = df_ovw.drop(columns=["deal_value"])
 
-# 4. 合并监管聚合结果到清洗后主表
+# 4. Merge regulatory aggregation results into cleaned main table
 if len(reg_vars) > 0:
     print(f"\nReg agg stats: total deals with reg info = {len(reg_vars):,}")
     print(f"reg_body_count min/max/mean: {reg_vars['reg_body_count'].min()} / {reg_vars['reg_body_count'].max()} / {reg_vars['reg_body_count'].mean():.2f}")
@@ -525,21 +525,21 @@ if len(reg_vars) > 0:
         cnt = reg_vars[f"reg_{cat}"].sum()
         print(f"  reg_{cat} = {cnt:,}")
     df_ovw = df_ovw.merge(reg_vars, on="deal_num", how="left")
-    # 空值填充
+    # Fill missing values
     count_cols = ["reg_body_count", "reg_country_count"]
     dummy_cols = [f"reg_{cat}" for cat in REG_CATEGORY_KEYWORDS] + ["reg_cross_national", "reg_common_law", "reg_civil_law", "reg_mixed_legal"]
     for c in count_cols:
         df_ovw[c] = df_ovw.fillna({c:0})[c].astype(int)
     for c in dummy_cols:
         df_ovw[c] = df_ovw.fillna({c:0})[c].astype(int)
-    # 修复笔误：之前错填regulatory_bodies字段
+    # Fix typo: previously incorrectly filled regulatory_bodies field
     df_ovw["regulatory_bodies"] = df_ovw.fillna({"regulatory_bodies":""})["regulatory_bodies"]
     df_ovw["regulatory_countries"] = df_ovw.fillna({"regulatory_countries":""})["regulatory_countries"]
     print("\nRegulatory variables merge complete, real multi-count enabled")
 else:
     print("Warning: zero regulatory records found in raw data")
 
-# 输出统计
+# Output statistics
 total_rows = len(df_ovw)
 tar_miss = df_ovw['tar_country_code'].isna().sum()
 acq_miss = df_ovw['acq_country_code'].isna().sum()
@@ -547,7 +547,7 @@ deal_status_miss = df_ovw['deal_status'].isna().sum()
 tar_bvd_miss = df_ovw['tar_bvd_id_num'].isna().sum()
 reg_has = df_ovw['reg_body_count'].gt(0).sum()
 
-print(f"\nModule E Final Output: {len(df_ovw):,} rows | unique deal_num: {df_ovw['deal_num'].nunique():,}")
+print(f"\nMODULE 01b.overview_country Final Output: {len(df_ovw):,} rows | unique deal_num: {df_ovw['deal_num'].nunique():,}")
 print(f"tar_country missing: {tar_miss:,} ({tar_miss/total_rows*100:.1f}%)")
 print(f"acq_country missing: {acq_miss.sum():,} ({acq_miss/total_rows*100:.1f}%)")
 print(f"deal_status missing: {deal_status_miss:,} ({deal_status_miss/total_rows*100:.1f}%)")
@@ -556,22 +556,23 @@ print(f"Deals with regulatory review: {reg_has:,} ({reg_has/total_rows*100:.1f}%
 print(f"Max regulatory bodies per single deal: {df_ovw['reg_body_count'].max()}")
 
 print("\nTop20 target country distribution:")
-print("  " + "⚠️" * 3 + " 以下为【原始 overview 文件，未经任何样本筛选】的国别构成")
-print("      含大量小额 / 非上市收购方 / 无完成日期的交易，")
-print("      不代表最终分析样本。分析样本构成见 table1 Panel E。")
+print("  " + "!" * 3 + "  Below is the country distribution of the RAW overview file (no sample filtering)")
+print("      Contains many small deals / non-listed acquirers / deals without completion dates,")
+print("      does not represent the final analysis sample. See table1 Panel E for analysis sample composition.")
 print(df_ovw["tar_country_code"].value_counts().head(20).to_string())
-print(f"多标的交易导致的额外行数: {len(df_ovw) - df_ovw['deal_num'].nunique():,}")
+print(f"Extra rows from multi-target deals: {len(df_ovw) - df_ovw['deal_num'].nunique():,}")
 
-# 补充：reg_* 变量实际生效的子集
+# Supplement: subset where reg_* variables actually apply
 if "reg_body_count" in df_ovw.columns:
     _sub = df_ovw[df_ovw["reg_body_count"] > 0]
-    print(f"\n【附】有监管记录的子集 N={len(_sub):,} 行 "
+    print(f"\n[Appendix] Subset with regulatory records N={len(_sub):,} rows "
           f"(unique deal {_sub['deal_num'].nunique():,})")
-    print("      reg_* 变量仅在此子集内非零：")
+    print("      reg_* variables are non-zero only within this subset:")
     print(_sub["tar_country_code"].value_counts().head(10).to_string())
     
-# 保存文件
+# Save file
 out_path = os.path.join(CLEANED, "01b_deal_overview.csv")
 df_ovw.to_csv(out_path, index=False, encoding="utf-8-sig")
 size_kb = os.path.getsize(out_path)/1024
 print(f"\nSaved cleaned file → {out_path} ({size_kb:.0f} KB)")
+#（注：内容由AI生成）
