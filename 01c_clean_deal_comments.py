@@ -394,13 +394,13 @@ df.rename(columns={
 }, inplace=True)
 _dn = pd.to_numeric(df["deal_num"], errors="coerce")
 _bad = _dn.isna() | (_dn % 1 != 0) | (_dn < 1e4) | (_dn >= 1e13)
-log(f"[check] 读取 {len(df):,} 行 | deal_num 非法 {int(_bad.sum()):,} 行 "
+log(f"[check] Read {len(df):,} rows | invalid deal_num {int(_bad.sum()):,} rows "
     f"| unique {int(_dn.nunique()):,}")
 if _bad.any():
-    log(f"[check] 非法样例: {df.loc[_bad, 'deal_num'].head(5).tolist()}")
+    log(f"[check] Invalid examples: {df.loc[_bad, 'deal_num'].head(5).tolist()}")
     df = df.loc[~_bad].copy()
     
-print("开始抽取Deal comments特征（LM金融词典版）...")
+print("Extracting deal comment features (LM financial dictionary)...")
 feat_result = df.apply(lambda row: extract_features(row), axis=1)
 feat_df = pd.DataFrame(feat_result.tolist())
 # Fix: must concat with axis=1 to join the original table and the feature table side by side
@@ -410,16 +410,16 @@ if "comment_wordcount" in df_full.columns:
     _n0 = len(df_full)
     df_full = df_full[df_full["comment_wordcount"].notna()].copy()
     df_full = df_full.reset_index(drop=True)
-    log(f"[clean] 删除空特征行: {_n0 - len(df_full):,} 行 | 剩余 {len(df_full):,} 行")
+    log(f"[clean] Dropped empty-feature rows: {_n0 - len(df_full):,} rows | remaining {len(df_full):,} rows")
 else:
-    log("[clean] 警告：未找到 comment_wordcount 列，跳过清理")
+    log("[clean] WARNING: comment_wordcount column not found, skipping cleaning")
     
 # Calculate the composite complexity score (deprecated; see the note above calc_complex)
 if EMIT_COMPLEXITY:
     df_full["deal_complexity_score"] = df_full.apply(calc_complex, axis=1)
-    log("[info] deal_complexity_score 已生成")
+    log("[info] deal_complexity_score generated")
 else:
-    log("[info] deal_complexity_score 已跳过 (EMIT_COMPLEXITY=False)")
+    log("[info] deal_complexity_score skipped (EMIT_COMPLEXITY=False)")
 df_full["log_comment_wordcount"] = np.log1p(df_full["comment_wordcount"])
 # ========== Added: drop raw long-text fields before export ==========
 drop_raw_text = [
@@ -463,3 +463,4 @@ with open(diag_path, "w", encoding="utf-8") as f:
     f.write("\n".join(diag_lines))
 log(f"\nDiagnostics saved → {diag_path}")
 log("\nScript 01c complete.")
+
