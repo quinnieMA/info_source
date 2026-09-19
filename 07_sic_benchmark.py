@@ -423,8 +423,10 @@ new_cols = [
     "benchdiv_rev", "benchdiv_ebitda", "benchdiv_ebit", "benchdiv_mean",
     # FIXER R1: M3 — per-multiple fallback level tracking
     "sic_level_used_rev", "sic_level_used_ebitda", "sic_level_used_ebit",
+    
 ]
 log.info(f"New columns added: {new_cols}")
 
 log.info("=== Script 07 complete ===")
 logging.shutdown()
+
