@@ -145,7 +145,7 @@ def coverage(df, col, label=None):
     return pct
 
 def filter_valid_triple(df_sub):
-    """过滤三元主键全部非空的行，丢弃任意键为空的脏数据"""
+    """Filter rows where all triple-key columns are non-null; drop rows with any null key"""
     triple_keys = ["deal_num", "tar_name", "tar_bvd_id_num", "acq_name", "acq_bvd_id_num"]
     mask = pd.Series(True, index=df_sub.index)
     for k in triple_keys:
@@ -173,7 +173,7 @@ log(f"Unique deal_num   : {df['deal_num'].nunique():,}")
 log(f"Columns           : {df.shape[1]}")
 
 
-# ── 诊断：listed acq × advisor（不碰 master 列名） ────────────────────────
+# -- Diagnostic: listed acq x advisor (do not touch master column names) --
 df_ls = pd.read_csv(os.path.join(CLEANED, "03b_listed_status.csv"))
 df_adv = pd.read_csv(os.path.join(CLEANED, "03b_firm_advisor_count.csv"))
 m1 = df_ls[df_ls["acq_listed"]==1]["deal_num"].nunique()
@@ -193,7 +193,7 @@ df_fin = pd.read_csv(os.path.join(CLEANED, "03_firm_financial_predeal.csv"),
 df_fin["deal_num"] = pd.to_numeric(df_fin["deal_num"], errors="coerce").astype("Int64")
 log(f"Financial rows    : {len(df_fin):,} | unique deals: {df_fin['deal_num'].nunique():,}")
 
-# master(deal‑level) left join predeal on TRIPLE KEY，允许业务膨胀
+# master (deal-level) left join predeal on TRIPLE KEY; business-driven row expansion allowed
 df = df.merge(df_fin, on=MERGE_KEYS, how="inner", suffixes=("", "_src"))
 assert_no_row_multiplication(df, BASE_ROWS, "Step 2", max_expansion_factor=2.0)
 
@@ -222,7 +222,7 @@ df_post = pd.read_csv(os.path.join(CLEANED, "03b_firm_financial_postdeal.csv"),
 df_post["deal_num"] = pd.to_numeric(df_post["deal_num"], errors="coerce").astype("Int64")
 log(f"Post financial rows: {len(df_post):,} | unique deals: {df_post['deal_num'].nunique():,}")
 
-# ✅ on=MERGE_KEYS 三元复合键！！
+# on=MERGE_KEYS triple composite key
 df = df.merge(df_post, on=MERGE_KEYS, how="inner", suffixes=("", "_src"))
 assert_no_row_multiplication(df, BASE_ROWS, "Step 3", max_expansion_factor=2.0)
 
@@ -242,7 +242,7 @@ coverage(df, "post_deal_acq_shareholder_funds_1st_avail_yr")
 log("\n" + "=" * 60)
 log("STEP 4 — Merge firm_financial_company.csv")
 log("=" * 60)
-# 调试
+# debug
 
 
 df_cf = pd.read_csv(os.path.join(CLEANED, "03_firm_financial_company.csv"),
@@ -250,7 +250,7 @@ df_cf = pd.read_csv(os.path.join(CLEANED, "03_firm_financial_company.csv"),
 df_cf["deal_num"] = pd.to_numeric(df_cf["deal_num"], errors="coerce").astype("Int64")
 log(f"Company fin rows  : {len(df_cf):,} | unique deals: {df_cf['deal_num'].nunique():,}")
 
-# ✅三元key
+# triple key
 df = df.merge(df_cf, on=MERGE_KEYS, how="inner", suffixes=("", "_src"))
 assert_no_row_multiplication(df, BASE_ROWS, "Step 4", max_expansion_factor=2.0)
 
@@ -274,8 +274,8 @@ df_leg["deal_num"] = pd.to_numeric(df_leg["deal_num"], errors="coerce").astype("
 log(f"Legal rows        : {len(df_leg):,} | unique deals: {df_leg['deal_num'].nunique():,}")
 
 
-# ⚠️这里注意：03_firm_legal颗粒度也是三元，原脚本只用deal_num会造成笛卡尔膨胀！
-# 原脚本bug：df = df.merge(df_leg, on="deal_num", how="left")
+# Note: 03_firm_legal is also triple-grain; original script using deal_num alone causes Cartesian explosion!
+# Original bug: df = df.merge(df_leg, on="deal_num", how="left")
 df = df.merge(df_leg, on=MERGE_KEYS, how="inner", suffixes=("", "_src"))
 assert_no_row_multiplication(df, BASE_ROWS, "Step 5", max_expansion_factor=2.0)
 
@@ -487,28 +487,28 @@ log("\n--- M&A Advisor count variables (Module J) ---")
 adv_all_cols = [c for c in df.columns if c.startswith("num_") and ("adv" in c)]
 for v in adv_all_cols:
     coverage(df, v)
-# ====================== 修复版：动态排序，不会报KeyError ======================
+# ====================== Fixed version: dynamic sorting, no KeyError ======================
 log("\n" + "="*60)
 log("EXTRA CHECK: Duplicate deal_num | deal_num + tar_name + acq_name")
 log("="*60)
 
-# 统计每个deal出现次数
+# Count occurrences per deal
 deal_count = df["deal_num"].value_counts()
 dup_deal_list = deal_count[deal_count > 1].index.tolist()
 
 if len(dup_deal_list) == 0:
-    log("✅ 全部deal_num唯一，无多标的/多收购方拆分记录")
+    log("OK: all deal_num unique, no multi-target/multi-acquirer splits")
 else:
-    log(f"⚠️ 存在重复deal，总数量：{len(dup_deal_list)}")
-    log(f"前10个重复deal编号：{dup_deal_list[:10]}")
+    log(f"WARNING: duplicate deals found, total: {len(dup_deal_list)}")
+    log(f"First 10 duplicate deal numbers: {dup_deal_list[:10]}")
 
-    # 固定需要展示三列，自动筛选表里实际存在的字段
+    # Display three fixed columns; auto-select fields that actually exist in the table
     show_cols = ["deal_num", "tar_name_x", "tar_name_src","acq_name_x","acq_name_src"]
     exist_cols = [c for c in show_cols if c in df.columns]
     df_dup_raw = df[df["deal_num"].isin(dup_deal_list)]
     df_dup_view = df_dup_raw[exist_cols]
 
-    # 动态取排序字段：只用表里有的列，优先deal_num
+    # Dynamically pick sort columns: only use columns present in the table, deal_num first
     sort_keys = ["deal_num"]
     if "tar_name" in exist_cols:
         sort_keys.append("tar_name")
@@ -516,23 +516,23 @@ else:
         sort_keys.append("acq_name")
     df_dup_view = df_dup_view.sort_values(by=sort_keys)
 
-    log("\n【明细预览 前60行：deal_num | tar_name | acq_name】")
+    log("\n[Detail preview first 60 rows: deal_num | tar_name | acq_name]")
     log(df_dup_view.head(60).to_string(index=False))
 
-    # 统计每个deal对应多少条观测
+    # Count observations per deal
     stat_df = deal_count.reset_index()
-    stat_df.columns = ["deal_num", "记录条数"]
-    log("\n【重复deal条数分布 前30】")
+    stat_df.columns = ["deal_num", "row_count"]
+    log("\n[Duplicate deal row count distribution top 30]")
     log(stat_df.head(30).to_string(index=False))
 
-    # 导出完整明细到txt，三列齐全
+    # Export full detail to txt, three columns complete
     out_dup = os.path.join(MERGED, "04_dup_deal_tar_acq_full.txt")
     with open(out_dup, "w", encoding="utf-8") as f:
-        f.write("重复交易完整明细（deal_num, tar_name, acq_name）\n")
+        f.write("Duplicate deal full detail (deal_num, tar_name, acq_name)\n")
         f.write(df_dup_view.to_string(index=False))
-    log(f"\n完整明细已保存至：{out_dup}")
+    log(f"\nFull detail saved to: {out_dup}")
 # =============================================================================
-# ====================== MERGE 对账检查（修正版）========================
+# ====================== MERGE reconciliation check (corrected version) ======================
 log("\n" + "="*60)
 log("EXTRA CHECK: Duplicate deal_num → show tar/acq name alignment")
 log("="*60)
@@ -541,13 +541,13 @@ deal_count = df["deal_num"].value_counts()
 dup_deal_list = deal_count[deal_count > 1].index.tolist()
 
 if len(dup_deal_list) == 0:
-    log("✅ 全部deal_num唯一，无多标的/多收购方拆分记录")
+    log("OK: all deal_num unique, no multi-target/multi-acquirer splits")
 else:
-    log(f"⚠️ 存在重复deal，总数量：{len(dup_deal_list)}")
-    log(f"前10个重复deal编号：{dup_deal_list[:10]}")
+    log(f"WARNING: duplicate deals found, total: {len(dup_deal_list)}")
+    log(f"First 10 duplicate deal numbers: {dup_deal_list[:10]}")
 
-    # ✅ 关键：用最终表里【真实存在】的名字列
-    # 优先 tar_name（清理后标准名），其次 _src，兜底 _x
+    # Key: use name columns that actually exist in the final table
+    # Prefer tar_name (cleaned standard name), then _src, fallback _x
     name_candidates_tar = ["tar_name", "tar_name_src", "tar_name_ovw"]
     name_candidates_acq = ["acq_name", "acq_name_src", "acq_name_ovw"]
 
@@ -558,59 +558,59 @@ else:
     if tar_col: show_cols.append(tar_col)
     if acq_col: show_cols.append(acq_col)
 
-    log(f"实际选用的展示列：{show_cols}")
+    log(f"Display columns actually used: {show_cols}")
 
     df_dup_raw = df[df["deal_num"].isin(dup_deal_list)]
     df_dup_view = df_dup_raw[show_cols].copy()
 
-    # 排序
+    # Sort
     sort_keys = ["deal_num"]
     if tar_col: sort_keys.append(tar_col)
     if acq_col: sort_keys.append(acq_col)
     df_dup_view = df_dup_view.sort_values(by=sort_keys)
 
-    log("\n【重复交易明细预览 前10行】")
+    log("\n[Duplicate deal detail preview first 10 rows]")
     log(df_dup_view.head(10).to_string(index=False))
 
-    # 统计
+    # Statistics
     stat_df = deal_count.reset_index()
-    stat_df.columns = ["deal_num", "记录条数"]
-    log("\n【重复deal条数分布 前30】")
+    stat_df.columns = ["deal_num", "row_count"]
+    log("\n[Duplicate deal row count distribution top 30]")
     log(stat_df.head(30).to_string(index=False))
 
     out_dup = os.path.join(MERGED, "04_dup_deal_tar_acq_full.txt")
     with open(out_dup, "w", encoding="utf-8") as f:
-        f.write("重复交易完整明细（deal_num, tar_name, acq_name）\n")
+        f.write("Duplicate deal full detail (deal_num, tar_name, acq_name)\n")
         f.write(df_dup_view.to_string(index=False))
-    log(f"\n完整明细已保存至：{out_dup}")
+    log(f"\nFull detail saved to: {out_dup}")
    
 # =============================================================================
-# POST-MERGE 精准清理（白名单 + 精确 in 列表，绝不误删日期列）
+# POST-MERGE precise cleanup (whitelist + exact in-list, never accidentally delete date columns)
 # =============================================================================
 log("\n" + "="*60)
-log("POST-MERGE 精准清理：仅删指定后缀 + 指定文本列")
+log("POST-MERGE precise cleanup: only delete specified suffixes + specified text columns")
 log("="*60)
 
-# ── 1. 白名单：这些列永远不删 ──────────────────────────────────────────
-# 主键
+# -- 1. Whitelist: these columns are never deleted --
+# Primary keys
 KEEP_WHITELIST = set(MERGE_KEYS) | {"deal_num", "_row_id"}
 
-# 裸名（最终保留版）
+# Bare names (final retained version)
 KEEP_WHITELIST.add("tar_name")
 KEEP_WHITELIST.add("acq_name")
 
-# 自动保护所有日期列（_d / _yr / _date 结尾的）
+# Auto-protect all date columns (ending in _d / _yr / _date)
 date_cols = [c for c in df.columns if c.endswith(("_yr", "_d", "_date"))]
 KEEP_WHITELIST.update(date_cols)
 
-log(f"白名单列数（永不删除）：{len(KEEP_WHITELIST)}")
-log(f"  主键 5 个 + tar/acq_name + _row_id + 日期列 {len(date_cols)} 个")
+log(f"Whitelist column count (never deleted): {len(KEEP_WHITELIST)}")
+log(f"  5 primary keys + tar/acq_name + _row_id + {len(date_cols)} date columns")
 
-# ── 2. 要删的：精确罗列（用 in，不用 not in） ──────────────────────────
-# 2a. 副表后缀（name 类带后缀的）
+# -- 2. To delete: enumerate explicitly (use in, not not-in) --
+# 2a. Secondary table suffixes (name columns with suffixes)
 SUFFIX_DROP = ("_src", "_x", "_y", "_ovw")
 
-# 2b. 长文本列（精确关键词）
+# 2b. Long text columns (exact keywords)
 TEXT_DROP_KEYWORDS = (
     "_busi_descr",
     "_trade_descr_en",
@@ -618,67 +618,67 @@ TEXT_DROP_KEYWORDS = (
     "_descr",
 )
 
-# ── 3. 构造删除列表（只含精确匹配到的） ────────────────────────────────
+# -- 3. Build delete list (only exact matches) --
 drop_cols = []
 
 for col in df.columns:
     if col in KEEP_WHITELIST:
-        continue  # 白名单永不删
+        continue  # Whitelist: never delete
 
-    # 规则 A：name 列带后缀 → 删
+    # Rule A: name columns with suffix -> delete
     if (col.startswith("tar_name") or col.startswith("acq_name")):
         if col not in ("tar_name", "acq_name"):
             drop_cols.append(col)
         continue
 
-    # 规则 B：以指定后缀结尾 → 删
+    # Rule B: ending with specified suffix -> delete
     if col.endswith(SUFFIX_DROP):
         drop_cols.append(col)
         continue
 
-    # 规则 C：包含指定文本关键词 → 删
+    # Rule C: contains specified text keyword -> delete
     if any(kw in col for kw in TEXT_DROP_KEYWORDS):
         drop_cols.append(col)
         continue
 
-# ── 4. 执行删除 ──────────────────────────────────────────────────────────
+# -- 4. Execute deletion --
 if drop_cols:
     df = df.drop(columns=drop_cols, errors="ignore")
-    log(f"\n已删除 {len(drop_cols)} 个列（仅限指定后缀 + 文本列）：")
-    # 分组打印，方便你检查
+    log(f"\nDeleted {len(drop_cols)} columns (only specified suffixes + text columns):")
+    # Grouped print for easy review
     name_dropped = [c for c in drop_cols if "name" in c.lower()]
     suffix_dropped = [c for c in drop_cols if c.endswith(SUFFIX_DROP)]
     text_dropped = [c for c in drop_cols if any(kw in c for kw in TEXT_DROP_KEYWORDS)]
     if name_dropped:
-        log(f"  【name后缀列】{len(name_dropped)}个：{name_dropped[:10]}{'...' if len(name_dropped)>10 else ''}")
+        log(f"  [name suffix cols] {len(name_dropped)}: {name_dropped[:10]}{'...' if len(name_dropped)>10 else ''}")
     if suffix_dropped:
-        log(f"  【副表后缀列】{len(suffix_dropped)}个：{suffix_dropped[:10]}{'...' if len(suffix_dropped)>10 else ''}")
+        log(f"  [secondary suffix cols] {len(suffix_dropped)}: {suffix_dropped[:10]}{'...' if len(suffix_dropped)>10 else ''}")
     if text_dropped:
-        log(f"  【长文本列】{len(text_dropped)}个：{text_dropped[:10]}{'...' if len(text_dropped)>10 else ''}")
+        log(f"  [long text cols] {len(text_dropped)}: {text_dropped[:10]}{'...' if len(text_dropped)>10 else ''}")
 else:
-    log("无需删除的列")
+    log("No columns to delete")
 
-# ── 5. 校验：关键日期列必须还在 ────────────────────────────────────────
-#log("\n【关键日期列校验】")
+# -- 5. Check: key date columns must still be present --
+#log("\n[Key date column check]")
 #date_check = ["announced_d_yr", "completed_d_yr", "withdrawn_d_yr", "deal_duration_yr"]
 #for c in date_check:
-    #status = "✅" if c in df.columns else "❌ 被误删！"
+    #status = "OK" if c in df.columns else "MISSING!"
     #log(f"  {c:<25s} {status}")
 
-# ── 6. 校验：主键 + 裸名必须还在 ────────────────────────────────────────
-log("\n【主键 + 核心字段校验】")
+# -- 6. Check: primary keys + bare names must still be present --
+log("\n[Primary key + core field check]")
 for c in ["deal_num", "tar_name", "acq_name"] + MERGE_KEYS:
-    status = "✅" if c in df.columns else "❌ 缺失！"
+    status = "OK" if c in df.columns else "MISSING!"
     log(f"  {c:<25s} {status}")
 
-# ── 7. 校验：不应有 _src/_x/_y/_ovw 残留 ───────────────────────────────
+# -- 7. Check: no _src/_x/_y/_ovw residue --
 bad = [c for c in df.columns if c.endswith(SUFFIX_DROP)]
 if not bad:
-    log("\n✅ 校验通过：无 _src/_x/_y/_ovw 后缀残留")
+    log("\nCheck passed: no _src/_x/_y/_ovw suffix residue")
 else:
-    log(f"\n⚠️ 仍有后缀列未清理：{bad}")
+    log(f"\nWARNING: suffix columns not cleaned: {bad}")
 
-log(f"\n最终列数：{df.shape[1]}")
+log(f"\nFinal column count: {df.shape[1]}")
 
 # ════════════════════════════════════════════════════════════════════════════
 # 8. Save outputs
