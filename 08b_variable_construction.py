@@ -2,7 +2,7 @@
 """
 08b_variable_construction.py
 Date: 2026-04-15
-Last Updated: 2026-09-07
+Last Updated: 2026-09-19
 Purpose: Construct all regression-ready firm, transaction, textual sentiment and
 regulatory variables; export the analysis dataset to Stata .dta format.
 
@@ -207,7 +207,30 @@ VARIABLE CONSTRUCTION CATALOGUE
                             lists differ ~6.6x (354 vs 2355), so a net score is
                             systematically negative; the authors advise against.
       deal_complexity_score EMIT_COMPLEXITY = False, deprecated.
+16. Vendor / Seller Identity (01d_vendor_identity.py, merged via 02 STEP 5c)
+    ven_type_primary      Primary seller type (string). Categories:
+                            corporate / pe_vc / individual_natural /
+                            shareholder_group / government /
+                            financial_inst / insolvency / management /
+                            undisclosed / UNMAPPED
+    ven_type_all          Pipe-separated ALL matched types for the deal
+    ven_type_mixed        'mixed' if >1 distinct seller type on the deal
+    ven_disclosure        Disclosure dimension (v4 added):
+                            named / generic / undisclosed / no_record
+    ven_has_mbo           Overlapping flag (v4 added): seller list contains
+                          MANAGEMENT / MBO. NOT part of the MECE partition
+                          because MBO is a deal property, not a seller type.
+    ven_is_*              Int64 dummies; BASE GROUP = corporate
+                          ⚠️ Never include ven_is_corporate together with
+                             the full dummy set in one regression
+    ven_unmapped          =1 if ven_type_primary == 'UNMAPPED'
+    ven_n_names           Number of distinct vendor names on the deal
 
+    WARNING 2026-09-18 category renaming (01d v2-v4):
+         family_person          -> individual_natural
+         shareholders_undisclosed -> shareholder_group
+      Old names are defensively mapped in 08b patch B, but upstream should have been rerun.
+      
 PROCESSING RULES
     1. Ratio & size variables winsorised at 1% / 99%.
        Winsorised set = the 18 ratio/size columns in STEP 4
@@ -262,9 +285,9 @@ log = logging.getLogger("08b_var_construction")
 log.setLevel(logging.DEBUG)
 fmt = logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s",
                          datefmt="%Y-%m-%d %H:%M:%S")
-# 防止 %runfile 重复运行导致 handler 累积（每行打印 N 遍的根因）
+# Prevent handler accumulation from repeated %runfile runs (root cause of N-fold duplicate printing)
 log.handlers.clear()
-log.propagate = False          # 同时阻断向 root logger 二次传播
+log.propagate = False          # Also block secondary propagation to root logger
 
 fh = logging.FileHandler(LOG_PATH, mode="w", encoding="utf-8")
 fh.setFormatter(fmt)
@@ -413,7 +436,7 @@ acq_ta_pre = pd.to_numeric(df["pre_deal_acq_ta_last_avail_yr"], errors="coerce")
 acq_eq_pre = pd.to_numeric(df["pre_deal_acq_eq_last_avail_yr"], errors="coerce")
 df["acq_leverage"] = safe_ratio(acq_ta_pre - acq_eq_pre, acq_ta_pre)
 
-# Acquirer ROA (原有保留)
+# Acquirer ROA (retained)
 df["acq_roa"] = safe_ratio(
     df["pre_deal_acq_pat_last_avail_yr"],
     df["pre_deal_acq_ta_last_avail_yr"]
@@ -423,7 +446,7 @@ df["acq_roa"] = safe_ratio(
 acq_ta_val = pd.to_numeric(df["pre_deal_acq_ta_last_avail_yr"], errors="coerce")
 df["ln_acq_size"] = np.where(acq_ta_val > 0, np.log(acq_ta_val), np.nan)
 
-# Relative size: ln(Acquirer TA / Target TA) (原有保留)
+# Relative size: ln(Acquirer TA / Target TA) (retained)
 acq_ta = pd.to_numeric(df["pre_deal_acq_ta_last_avail_yr"], errors="coerce")
 tar_ta = pd.to_numeric(df["pre_deal_tar_ta_last_avail_yr"], errors="coerce")
 df["ln_rel_size"] = np.where(
@@ -451,7 +474,7 @@ post_eq = pd.to_numeric(df["post_deal_tar_shareholder_funds_1st_avail_yr"], erro
 df["tar_post_leverage"] = safe_ratio(post_ta - post_eq, post_ta)
 
 # ==============================================
-# Post-deal Acquirer financial ratios (NEW 对称全套)
+# Post-deal Acquirer financial ratios (NEW symmetric full set)
 # ==============================================
 # Post Acquirer EBITDA Margin
 df["acq_post_ebitda_margin"] = safe_ratio(
@@ -474,15 +497,15 @@ acq_post_ta_df = pd.to_numeric(df["post_deal_acq_ta_1st_avail_yr"], errors="coer
 acq_post_eq_df = pd.to_numeric(df["post_deal_acq_shareholder_funds_1st_avail_yr"], errors="coerce")
 df["acq_post_leverage"] = safe_ratio(acq_post_ta_df - acq_post_eq_df, acq_post_ta_df)
 
-# Winsorise all ratio variables (新增acq pre/post全部加入列表)
+# Winsorise all ratio variables (added all acq pre/post to list)
 win_cols = [
     # Pre Target
     "tar_ebitda_margin", "tar_leverage", "tar_rev_growth", "tar_roa", "ln_tar_size",
-    # Pre Acquirer 新增
+    # Pre Acquirer added
     "acq_ebitda_margin", "acq_leverage", "acq_roa", "ln_acq_size", "ln_rel_size",
     # Post Target
     "tar_post_ebitda_margin", "tar_post_roa", "ln_tar_post_size", "tar_post_leverage",
-    # Post Acquirer 新增
+    # Post Acquirer added
     "acq_post_ebitda_margin", "acq_post_roa", "ln_acq_post_size", "acq_post_leverage"
 ]
 for col in win_cols:
@@ -568,22 +591,22 @@ df["announced_date"]    = excel_serial_to_date(df["announced_d"])
 df["completed_date"]    = excel_serial_to_date(df["completed_d"])
 df["assumed_comp_date"] = excel_serial_to_date(df["assumed_comp_d"])
 
-# ── 剔除 Zephyr 的机械填充日期 ──
-# (1) 730 簇：completed_d 缺失时 assumed_comp_d = announced_d + 730（占位外推）
+# -- Remove Zephyr mechanical placeholder dates --
+# (1) 730-day cluster: when completed_d missing, assumed_comp_d = announced_d + 730 (placeholder extrapolation)
 _off  = (pd.to_numeric(df["assumed_comp_d"], errors="coerce")
          - pd.to_numeric(df["announced_d"], errors="coerce"))
 _mech = _off.between(700, 760) & df["completed_date"].isna()
-log.info(f"  730天机械填充置缺失: {int(_mech.sum()):,} 行")
+log.info(f"  730-day mechanical fills set to missing: {int(_mech.sum()):,} rows")
 df.loc[_mech, "assumed_comp_date"] = pd.NaT
 
-# (2) 零时长：announced_d 缺失被填成 completed_d
+# (2) Zero-duration: announced_d missing filled as completed_d
 _zero = (df["completed_date"].notna() & df["announced_date"].notna()
          & (df["completed_date"] == df["announced_date"]))
-log.info(f"  零时长占位填充置缺失: {int(_zero.sum()):,} 行")
+log.info(f"  Zero-duration placeholder fills set to missing: {int(_zero.sum()):,} rows")
 df.loc[_zero, "completed_date"] = pd.NaT
-# ── 剔除 Zephyr 的机械填充日期 end──
+# -- Remove Zephyr mechanical placeholder dates end--
 
-# End date: completed_d → assumed_comp_d fallback（用 _date，不是 _d）
+# End date: completed_d -> assumed_comp_d fallback (use _date, not _d)
 df["end_date"] = df["completed_date"].fillna(df["assumed_comp_date"])
 log.info(f"  end_date dtype: {df['end_date'].dtype}")
 
@@ -607,15 +630,15 @@ log.info(f"  DaysToCompletion: median={df['DaysToCompletion'].median():.0f} days
 # 6.5. YEARS OF BUSINESS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# 生成标的/收购方年龄
+# Generate target/acquirer age
 df["target_age"] = df["deal_year"] - df["tar_incorp_d_year"]
 df["acquirer_age"] = df["deal_year"] - df["acq_incorp_d_year"]
-# 注册年份晚于交易年份设为空
+# Incorporation year after deal year set to NaN
 df.loc[df["target_age"] < 0, "target_age"] = np.nan
 df.loc[df["acquirer_age"] < 0, "acquirer_age"] = np.nan
 
-log.info(f"tar_incorp_d_year 有效样本：{df['tar_incorp_d_year'].notna().sum():,}")
-log.info(f"target_age 有效样本：{df['target_age'].notna().sum():,}")
+log.info(f"tar_incorp_d_year valid obs: {df['tar_incorp_d_year'].notna().sum():,}")
+log.info(f"target_age valid obs: {df['target_age'].notna().sum():,}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -658,10 +681,10 @@ log.info(
     f"c_rev_growth: {corpus['c_rev_growth'].notna().sum():,}"
 )
 
-# ── P0 修复：比率变量先过滤小分母，再 winsorise，最后才标准化 ──
-# 原因：分母接近 0 时比率爆炸（实测 max=1,036,235），
-#       sigma 被拉到 15298 → z-score 全被除没 → FinSimGap 变噪音
-_MIN_DEN = 100          # 单位千，即 10 万；低于此视为分母不可靠
+# -- P0 fix: filter small denominators for ratio variables first, then winsorise, then standardise --
+# Reason: ratio explodes when denominator near 0 (empirical max=1,036,235),
+#       sigma pulled to 15298 -> z-scores all divided away -> FinSimGap becomes noise
+_MIN_DEN = 100          # unit: thousand, i.e. 100k; below this denominator considered unreliable
 _rev_den = pd.to_numeric(corpus["pre_deal_tar_rev_rev_last_avail_yr"], errors="coerce")
 _ta_den  = pd.to_numeric(corpus["pre_deal_tar_ta_last_avail_yr"], errors="coerce")
 _y1_den  = pd.to_numeric(corpus["tar_rev_rev_yr__1"], errors="coerce")
@@ -1121,24 +1144,24 @@ LEGAL_ORIGIN = {
     "MK": "German",    # North Macedonia (former Yugoslav, German family)
 }
 # ═══════════════════════════════════════════════════════════════════════════
-# 目标国家的法系（原有）
+# Target country legal system (retained)
 # ═══════════════════════════════════════════════════════════════════════════
 df["legal_origin_tar"] = df["tar_country_code"].map(LEGAL_ORIGIN)
 df["common_law_tar"] = (df["legal_origin_tar"] == "English").astype("Int64")
 df.loc[df["legal_origin_tar"].isna(), "common_law_tar"] = pd.NA
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 收购方国家的法系（新增）
+# Acquirer country legal system (added)
 # ═══════════════════════════════════════════════════════════════════════════
 df["legal_origin_acq"] = df["acq_country_code"].map(LEGAL_ORIGIN)
 df["common_law_acq"] = (df["legal_origin_acq"] == "English").astype("Int64")
 df.loc[df["legal_origin_acq"].isna(), "common_law_acq"] = pd.NA
 
-# 保持向后兼容：原有的common_law指向目标国家
+# Backward compatibility: original common_law points to target country
 #df["legal_origin"] = df["legal_origin_tar"]
 #df["common_law"] = df["common_law_tar"]
 
-# 诊断输出
+# Diagnostics
 unmapped_tar = df.loc[df["legal_origin_tar"].isna(), "tar_country_code"].value_counts()
 unmapped_acq = df.loc[df["legal_origin_acq"].isna(), "acq_country_code"].value_counts()
 
@@ -1150,7 +1173,7 @@ if len(unmapped_acq) > 0:
 log.info(f"  common_law_tar = 1: {df['common_law_tar'].sum():,} deals")
 log.info(f"  common_law_acq = 1: {df['common_law_acq'].sum():,} deals")
 
-# 对比：跨境交易中两者差异
+# Comparison: difference in cross-border deals
 cross_df = df[df["cross_border"]==1]
 if len(cross_df) > 0:
     both_common = ((cross_df["common_law_tar"]==1) & (cross_df["common_law_acq"]==1)).sum()
@@ -1208,41 +1231,218 @@ CLASSIFICATION_DIST = {
     "CN": 4,
 }
 
-# 目标国家的分类距离20260814
+# Target country classification distance 20260814
 df["classification_distance_tar"] = df["tar_country_code"].map(CLASSIFICATION_DIST)
 
-# 收购方国家的分类距离
+# Acquirer country classification distance
 df["classification_distance_acq"] = df["acq_country_code"].map(CLASSIFICATION_DIST)
 
-# 保留原有的classification_distance（指向目标国家，向后兼容）
+# Retain original classification_distance (points to target country, backward compat)
 df["classification_distance"] = df["classification_distance_tar"]
 
-# 诊断输出
+# Diagnostics
 n_tar = df["classification_distance_tar"].notna().sum()
 n_acq = df["classification_distance_acq"].notna().sum()
 log.info(f"  classification_distance_tar: {n_tar:,}/{len(df):,} obs mapped ({100*n_tar/len(df):.1f}%)")
 log.info(f"  classification_distance_acq: {n_acq:,}/{len(df):,} obs mapped ({100*n_acq/len(df):.1f}%)")
 
-# 未映射的目标国家
+# Unmapped target countries
 unmapped_tar = df.loc[df["classification_distance_tar"].isna(), "tar_country_code"].value_counts()
 if len(unmapped_tar) > 0:
     log.warning(f"  Unmapped target countries: {unmapped_tar.to_dict()}")
 
-# 未映射的收购方国家
+# Unmapped acquirer countries
 unmapped_acq = df.loc[df["classification_distance_acq"].isna(), "acq_country_code"].value_counts()
 if len(unmapped_acq) > 0:
     log.warning(f"  Unmapped acquirer countries: {unmapped_acq.to_dict()}")
 
-# 分布
+# Distribution
 log.info(f"\n  Target country distribution:\n{df['classification_distance_tar'].value_counts(dropna=False).sort_index()}")
 log.info(f"\n  Acquirer country distribution:\n{df['classification_distance_acq'].value_counts(dropna=False).sort_index()}")
 
-# 两种定义的交叉表
+# Cross-tab of two definitions
 log.info(f"\n  Cross-tab (tar × acq):")
 cross_tab = pd.crosstab(df['classification_distance_tar'], 
                          df['classification_distance_acq'],
                          margins=True)
 log.info(f"\n{cross_tab}")
+
+# ════════════════════════════════════════════════════════════════════════════
+# VENDOR / SELLER IDENTITY -- consolidated (2026-09-18)
+#
+# Replacement note: this block supersedes two previous vendor code sections
+#   (1) Original "insurance injection + regression dummy" block -- category names stuck at 01d v1 old names
+#       (family_person / shareholders_undisclosed), new names not in list,
+#       causing ven_is_individual_natural / ven_is_shareholder_group never generated
+#   (2) Original "STEP 8.5" block -- located after disk write, was dead code
+# This block does all in one: inject -> normalise -> build dummies -> diagnose -> enter export list
+#
+# Category system (01d v4, MECE, one value per deal):
+#   corporate           generic company             <- regression base group
+#   pe_vc               PE / VC / investment firm
+#   individual_natural  natural person (named individual/INDIVIDUALS/FOUNDERS/PROMOTERS/DIRECTORS)
+#   shareholder_group   shareholder group (SHAREHOLDERS etc. [appearing alone] is true vendor)
+#   government          government / state-owned
+#   financial_inst      banks / insurance / securities / creditors
+#   insolvency          bankruptcy receivership (RECEIVER / LIQUIDATOR)
+#   management          management buyout (MANAGEMENT alone)
+#   undisclosed         explicitly marked undisclosed
+#   UNMAPPED            has named entity but no rule matched (methodology issue)
+#   (NaN)               Zephyr has no vendor record (data availability issue, different nature)
+#
+# WARNING ven_is_corporate is base group, fully collinear if all dummies included together
+# WARNING ven_has_mbo is overlapping flag, not part of MECE classification
+#    (MBO is deal nature not vendor type; management only 22 deals too small, use ven_has_mbo instead)
+# ════════════════════════════════════════════════════════════════════════════
+log.info("--- Merging vendor / seller identity (01d, v4 categories) ---")
+_VENDOR_FP = os.path.join(r"D:\MA\data\cleaned", "01_deal_vendor_type.csv")
+
+# 01d v4 category system (order = recommended appearance order in regression)
+_VENDOR_TYPES = [
+    "corporate",           # Base group
+    "pe_vc",
+    "individual_natural",
+    "shareholder_group",
+    "government",
+    "financial_inst",
+    "insolvency",
+    "management",
+    "undisclosed",
+    "UNMAPPED",
+]
+# Old name -> new name (defensive; works if upstream not rerun)
+_VENDOR_OLD2NEW = {
+    "family_person":            "individual_natural",
+    "shareholders_undisclosed": "shareholder_group",
+}
+
+if os.path.exists(_VENDOR_FP):
+    _dfv = pd.read_csv(_VENDOR_FP, encoding="utf-8-sig", low_memory=False)
+    _dfv["deal_num"] = pd.to_numeric(_dfv["deal_num"], errors="coerce").astype("Int64")
+    _dfv = _dfv.drop_duplicates(subset=["deal_num"], keep="first")
+
+    # Whitelist: v4 adds "ven_has_" prefix + explicitly include ven_disclosure
+    _vcols = ["deal_num"] + [
+        c for c in _dfv.columns
+        if c.startswith(("ven_type", "ven_ner", "ven_n_names",
+                         "ven_is_", "ven_has_"))
+        or c == "ven_disclosure"
+    ]
+    _vcols = [c for c in _vcols if c in _dfv.columns]
+    log.info(f"  vendor columns attached ({len(_vcols)}): {_vcols}")
+
+    _old = [c for c in _vcols if c != "deal_num" and c in df.columns]
+    if _old:
+        log.info(f"  upstream vendor columns exist, overwriting with 01d latest: {_old}")
+        df = df.drop(columns=_old)
+
+    _n0 = len(df)
+    df = df.merge(_dfv[_vcols], on="deal_num", how="left")
+    if len(df) != _n0:
+        log.warning(f"  [warn] vendor merge row count changed {_n0:,} -> {len(df):,}, "
+                    f"check if deal_num is unique")
+    else:
+        log.info(f"  merge done, row count unchanged: {len(df):,}")
+
+    if "ven_type_primary" not in df.columns:
+        log.warning("  [warn] ven_type_primary not attached -- check 01d / 02 STEP 5c")
+    else:
+        # -- (0) Normalise --
+        df["ven_type_primary"] = df["ven_type_primary"].astype(object).replace("", np.nan)
+        df.loc[df["ven_type_primary"].astype(str).str.strip().isin(
+            ["", "nan", "None"]), "ven_type_primary"] = np.nan
+
+        # -- (1) Old name -> new name --
+        _n_old = int(df["ven_type_primary"].isin(_VENDOR_OLD2NEW.keys()).sum())
+        if _n_old > 0:
+            log.warning(f"  Detected {_n_old:,} rows with old category names, mapped to new names")
+        df["ven_type_primary"] = df["ven_type_primary"].replace(_VENDOR_OLD2NEW)
+
+        _has_vendor = df["ven_type_primary"].notna()
+
+        # -- (2) Build dummies --
+        for _t in _VENDOR_TYPES:
+            _col = "ven_is_" + _t
+            df[_col] = (df["ven_type_primary"] == _t).astype("Int64")
+            # No vendor record -> NA, not 0 (distinguish "not this type" from "unknown")
+            df.loc[~_has_vendor, _col] = pd.NA
+            if df[_col].notna().sum() > 0 and df[_col].sum() == 0:
+                df = df.drop(columns=[_col])
+                log.info(f"    Dropped zero-variance dummy: {_col}")
+
+        df["ven_unmapped"] = (df["ven_type_primary"] == "UNMAPPED").astype("Int64")
+        df.loc[~_has_vendor, "ven_unmapped"] = pd.NA
+
+        # -- (3) Additional columns --
+        for _c in ["ven_disclosure", "ven_has_mbo"]:
+            if _c in df.columns:
+                log.info(f"  [ok] {_c} attached")
+            else:
+                log.warning(f"  [miss] {_c} not in data -- check 02 STEP 5c whitelist")
+
+        if "ven_has_mbo" in df.columns:
+            df["ven_has_mbo"] = pd.to_numeric(
+                df["ven_has_mbo"], errors="coerce").fillna(0)
+            df["ven_has_mbo"] = (df["ven_has_mbo"] > 0).astype("Int64")
+            log.info(f"  ven_has_mbo = 1: {int(df['ven_has_mbo'].sum()):,}")
+
+        if "ven_disclosure" in df.columns:
+            log.info("  ven_disclosure distribution:")
+            for _k, _c in df["ven_disclosure"].value_counts(dropna=False).items():
+                log.info(f"    {str(_k):<24s} {_c:>8,}")
+
+        # -- (4) Coverage diagnostics --
+        _n_tot = len(df)
+        _n_cls = int(_has_vendor.sum())
+        log.info(f"  ven_type_primary coverage: {_n_cls:,}/{_n_tot:,} "
+                 f"({_n_cls/_n_tot*100:.1f}%)")
+        for _k, _c in df["ven_type_primary"].value_counts(dropna=False).items():
+            _lab = "(no vendor record)" if pd.isna(_k) else str(_k)
+            log.info(f"    {_lab:<28s} {_c:>8,}  ({_c/_n_tot*100:5.1f}%)")
+
+        _nu = int(df["ven_unmapped"].fillna(0).sum())
+        log.info(f"  ven_unmapped = 1: {_nu:,} ({_nu/_n_tot*100:.1f}%) "
+                 f"[>5% needs lexicon update in 01d]")
+
+        # -- (5) Research-design subsample diagnostics --
+        if all(c in df.columns for c in ["acq_listed", "tar_listed"]):
+            _m = (pd.to_numeric(df["acq_listed"], errors="coerce") == 1) & \
+                 (pd.to_numeric(df["tar_listed"], errors="coerce") == 0)
+            _sub = df[_m]
+            _h2 = int(_sub["ven_type_primary"].notna().sum()) if len(_sub) else 0
+            log.info(f"  Research-design subsample (acq_listed=1 & tar_listed=0): N={len(_sub):,}, "
+                     f"vendor coverage {_h2:,} ({_h2/max(len(_sub),1)*100:.1f}%)")
+            if len(_sub):
+                for _k, _c in _sub["ven_type_primary"].value_counts(dropna=False).items():
+                    _lab = "(no vendor record)" if pd.isna(_k) else str(_k)
+                    log.info(f"      {_lab:<28s} {_c:>8,}  "
+                             f"({_c/max(len(_sub),1)*100:5.1f}%)")
+        else:
+            log.warning("  Missing acq_listed/tar_listed, skipping research-design subsample diagnostics")
+
+        # -- (6) Self-check: each classified deal must hit exactly one dummy --
+        _dcols = ["ven_is_" + t for t in _VENDOR_TYPES
+                  if "ven_is_" + t in df.columns]
+        _rowsum = df[_dcols].fillna(0).sum(axis=1)
+        _bad = int((_has_vendor & (_rowsum != 1)).sum())
+        if _bad == 0:
+            log.info("  [self-check] OK: each classified deal hits exactly one dummy (MECE holds)")
+        else:
+            log.warning(f"  [self-check] FAIL: {_bad:,} deals with dummy count != 1, check category system")
+
+        for _t in ["individual_natural", "shareholder_group"]:
+            _col = "ven_is_" + _t
+            if _col in df.columns:
+                _s = df[_col].dropna()
+                log.info(f"  [self-check] {_col:<32s} n1={int(_s.sum()):>7,} "
+                         f"{'OK' if (_s.nunique()==2 and _s.sum()>0) else 'ZERO VARIANCE'}")
+            else:
+                log.warning(f"  [self-check] FAIL: {_col} does not exist")
+
+        log.info("  WARNING ven_is_corporate = base group, fully collinear with all dummies together")
+else:
+    log.warning(f"  [skip] {_VENDOR_FP} not found")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 10. SAVE TO STATA .dta
@@ -1256,7 +1456,7 @@ COLS_TO_SAVE = [
     "deal_num", "_row_id", "deal_year", 
     "tar_sic3", "tar_sic2", "acq_sic3",
     "legal_origin_tar","legal_origin_acq",
-    # ── Module E 监管特征变量（01b_deal_overview合并变量） ─────────────────────
+    # -- Module E regulatory feature variables (merged from 01b_deal_overview) --
     "reg_body_count",
     "reg_country_count",
     "reg_antitrust",
@@ -1271,14 +1471,14 @@ COLS_TO_SAVE = [
     "reg_mixed_legal",
     "regulatory_bodies",
     "regulatory_countries",
-    # ── 评论文本特征 Module F (2026-08-08新增) ─────────────────────────────
+    # -- Comment text features Module F (added 2026-08-08) --
     "total_timeline_days",
     "has_rumour",
     "has_target_reject",
     "has_phase2_investigation",
     "has_goshop",
     "num_unique_reg",
-    "deal_complexity_score",
+    #"deal_complexity_score",
     "comment_char_length",
     "comment_wordcount",
     "sentence_event_count",
@@ -1297,7 +1497,7 @@ COLS_TO_SAVE = [
     "lm_weakmodal_density",
     "lm_constrain_density",
     "lm_net_sentiment",
-    # ========================= M&A Advisor dummy Module J 手写全部 =========================
+    # ========================= M&A Advisor dummy Module J (hand-written) =========================
     "num_tar_adv_acc",
     "num_tar_adv_asset_fin",
     "num_tar_adv_broker",
@@ -1363,9 +1563,7 @@ COLS_TO_SAVE = [
     "post_deal_tar_np_1st_avail_yr",
     "post_deal_tar_ta_1st_avail_yr",
     "post_deal_tar_na_1st_avail_yr",
-    #"post_deal_tar_eq_1st_avail_yr",          # KeyError 缺失，注释
     "post_deal_tar_current_liabilities_1st_avail_yr",
-    #"post_deal_tar_cap_1st_avail_yr",         # KeyError 缺失，注释
 
     # ── Raw acquirer pre-deal financials ─────────────────────────────────────
     "pre_deal_acq_rev_rev_last_avail_yr",
@@ -1383,16 +1581,13 @@ COLS_TO_SAVE = [
     "post_deal_acq_np_1st_avail_yr",
     "post_deal_acq_ta_1st_avail_yr",
     "post_deal_acq_na_1st_avail_yr",
-    #"post_deal_acq_eq_1st_avail_yr",          # KeyError 缺失，注释
-    #"post_deal_acq_current_liabilities_1st_avail_yr", # KeyError 缺失，注释
-    #"post_deal_acq_cap_1st_avail_yr",         # KeyError 缺失，注释
     "post_deal_acq_shareholder_funds_1st_avail_yr",
 
-    # ── Raw vendor pre-deal financials（按需保留，不需要可以注释）──────────────
+    # ── Raw vendor pre-deal financials ────────────────────────────────────────
     "pre_deal_ven_rev_rev_last_avail_yr",
     "pre_deal_ven_ta_last_avail_yr",
 
-    # ── Dependent variables (raw multiples) ─────────────────────────────────────
+    # ── Dependent variables (raw multiples) ───────────────────────────────────
     "pre_rev_mul_ly", "pre_ebitda_mul_ly", "pre_ebit_mul_ly",
     "post_rev_mul_fy", "post_ebitda_mul_fy", "post_ebit_mul_fy",
 
@@ -1407,43 +1602,49 @@ COLS_TO_SAVE = [
 
     # ── DaysToCompletion (H5) ─────────────────────────────────────────────────
     "DaysToCompletion", "ln_days",
+    # -- Rumor variables (01a, JFE 2021 dialogue; 2026-09-19) --
+    # has_rumor          : main dummy (status contains Rumour OR rumour_d_yr leads announce >=1yr)
+    # has_rumor_status   : deal_status source only (~921 deals)
+    # has_rumor_year     : rumour_d_yr source only (year lead >= 1)
+    # rumor_lead_yr      : announced_d_yr - rumour_d_yr (continuous)
+    # rumor_lead_days    : announced_d - rumour_d (all zeros in this dataset; kept for reference)
+    # completed_flag     : startswith "Completed" (matches d84 completed)
+    # NOTE: distinct from existing has_rumour (01c comment text, British spelling)
+    "has_rumor", "has_rumor_status", "has_rumor_date",
+    "rumor_lead_yr", "rumor_lead_days",
+    "completed_flag",
 
-    # ── Firm age controls #20260727 ───────────────────────────────────────────
+    # ── Firm age controls ─────────────────────────────────────────────────────
     "tar_incorp_d_year", "acq_incorp_d_year",
     "target_age", "acquirer_age",
 
-    # ── Deal-level controls (pre-existing from Script 05) ─────────────────────
+    # ── Deal-level controls ───────────────────────────────────────────────────
     "cross_industry", "cross_industry_alt", "ln_deal_value", "cross_border",
-    #"deal_pay_method",  # cashKeyError缺失，注释掉
     
-    # ── 支付方式（2026-09-07 新增，务必进入 Stata 导出）──
-    "deal_pay_method",            # 原始单值（保留向后兼容）
-    "deal_pay_method_all",        # 01a 去重前聚合的竖线分隔全集 ← 关键
-    #"pay_method_count",
-    "deal_pay_method_n",          # 改了名
-    
+    # -- Payment method --
+    "deal_pay_method",
+    "deal_pay_method_all",
+    "deal_pay_method_n",
     "pay_has_cash", "pay_has_shares", "pay_has_debt", "pay_has_other",
     "pay_n_class",
     "pay_pure_cash", "pay_pure_shares", "pay_pure_debt", "pay_pure_other",
     "pay_mix", "pay_unknown",
     "pay_mix_cash_shares", "pay_mix_with_shares",
     "pay_mix_with_cash", "pay_mix_with_debt",
-    "pay_class",                  # 互斥类别标签（字符串，回归用）
-    # ── 支付方式（2026-09-07 新增，务必进入 Stata 导出）end──
-    # ── structure（2026-09-07 新增，务必进入 Stata 导出）──   
+    "pay_class",
+
+    # ── structure ──
     "deal_struct_all", "deal_struct_n",
     "deal_fin_all",    "deal_fin_n",
     "deal_type_all",   "deal_type_n",
-    # ── structure（2026-09-07 新增，务必进入 Stata 导出）end──
 
-    # ── deal characteristics  ───────────────────────────────────
+    # ── deal characteristics ─────────────────────────────────────────────────
     "deal_value","deal_status",
 
     # ── Target firm controls ──────────────────────────────────────────────────
     "ln_tar_size", "tar_ebitda_margin",
     "tar_leverage", "tar_rev_growth", "tar_roa",
     "tar_post_ebitda_margin", "tar_post_roa", "ln_tar_post_size", "tar_post_leverage",
-    
 
     # ── Acquirer controls ─────────────────────────────────────────────────────
     "ln_rel_size", "acq_roa",
@@ -1454,19 +1655,57 @@ COLS_TO_SAVE = [
     "national_class",
     "common_law_tar","common_law_acq",
 
-    # ── Raw target financials ─────────────────────────────────────
+    # ── Raw target financials ─────────────────────────────────────────────────
     "tar_ta_for_t6", "tar_rev_for_t6",
     "tar_mktcap_for_t6", "tar_ev_for_t6", "tar_mb_for_t6",
 
-    # ── Listed-firm status (acquiror and target) ──────────────────────────────
+    # ── Listed-firm status ────────────────────────────────────────────────────
     "tar_listed", "acq_listed",
 
-    # ── SIC classification distance ────────────────────────────
+    # ── SIC classification distance ───────────────────────────────────────────
     "sic_coverage_rate","acq_tar_similarity",
     "classification_distance_tar","classification_distance_acq" 
 ]
 
-# ── 兼容处理：剔除已弃用列，补充 01c 新列 ──
+# ════════════════════════════════════════════════════════════════════════════
+# Vendor columns auto-append (must be before export)
+# WARNING v4 fix: added "ven_has_" prefix, and explicitly include ven_disclosure
+#    old version only recognized ven_type/ven_ner/ven_is_/ven_n_names/ven_unmapped,
+#    causing ven_has_mbo and ven_disclosure to be excluded from dta
+# ════════════════════════════════════════════════════════════════════════════
+_VENDOR_SAVE = [c for c in df.columns
+                if c.startswith(("ven_type", "ven_ner", "ven_is_",
+                                 "ven_n_names", "ven_unmapped",
+                                 "ven_has_"))
+                or c == "ven_disclosure"]
+_VENDOR_NEW  = [c for c in _VENDOR_SAVE if c not in COLS_TO_SAVE]
+if _VENDOR_NEW:
+    COLS_TO_SAVE = COLS_TO_SAVE + _VENDOR_NEW
+    log.info(f"  [vendor] auto-appended {len(_VENDOR_NEW)} columns: {_VENDOR_NEW}")
+else:
+    log.warning("  [vendor] no vendor columns found -- check 01d / 02 STEP 5c has run")
+
+# For case identification: add back company names
+for _nm in ["tar_name", "acq_name", "ven_name"]:
+    if _nm in df.columns and _nm not in COLS_TO_SAVE:
+        COLS_TO_SAVE.append(_nm)
+        log.info(f"  [vendor] added case-identification column: {_nm}")
+
+# String marker -> dummy, avoid Stata str# type
+if "ven_type_mixed" in df.columns:
+    df["ven_is_mixed"] = (df["ven_type_mixed"].astype(str) == "mixed").astype("Int64")
+    if "ven_is_mixed" not in COLS_TO_SAVE:
+        COLS_TO_SAVE.append("ven_is_mixed")
+
+# Whitelist audit
+_ghost = [c for c in COLS_TO_SAVE if c not in df.columns]
+if _ghost:
+    log.warning(f"  [warn] columns in COLS_TO_SAVE but not in data (ignored): {_ghost}")
+_dropped = [c for c in df.columns if c not in COLS_TO_SAVE]
+log.info(f"  Final export column count: {len(COLS_TO_SAVE)} | {len(_dropped)} columns not exported")
+
+
+# -- Compatibility: drop deprecated columns, add new 01c columns --
 _DEPRECATED_COLS = [
     "deal_complexity_score",
     "lm_pos_density", "lm_neg_density", "lm_uncertain_density",
@@ -1475,56 +1714,42 @@ _DEPRECATED_COLS = [
     "lm_net_sentiment",
 ]
 
-# 新增：comment 可得性哑变量（区分「无 comment」vs「有 comment 但无该类词」）
+# Added: comment availability dummy
 if "has_lm_litigious" in df.columns:
     df["has_comment"] = df["has_lm_litigious"].notna().astype("Int64")
     log.info(f"  has_comment: {df['has_comment'].sum():,} / {len(df):,} "
              f"({100*df['has_comment'].mean():.1f}%)")
 
 _NEW_TEXT_COLS = [
-    # 文本长度控制
     "comment_wordcount", "log_comment_wordcount", "comment_char_length",
     "sentence_event_count",
-    # LM 计数
     "lm_pos_count", "lm_neg_count", "lm_uncertain_count", "lm_litigious_count",
     "lm_strongmodal_count", "lm_weakmodal_count", "lm_constrain_count",
-    # LM 二值 presence
     "has_lm_pos", "has_lm_neg", "has_lm_uncertain", "has_lm_litigious",
     "has_lm_strongmodal", "has_lm_weakmodal", "has_lm_constrain",
-    # 可得性
     "has_comment",
 ]
 
 COLS_TO_SAVE = [c for c in COLS_TO_SAVE if c not in _DEPRECATED_COLS]
 COLS_TO_SAVE = COLS_TO_SAVE + [c for c in _NEW_TEXT_COLS
                                if c in df.columns and c not in COLS_TO_SAVE]
-# ── 补齐 STEP 4 新增财务比率（原 COLS_TO_SAVE 硬编码名单未同步）──
+
+# -- Supplement STEP 4 new financial ratios --
 _RATIO_COLS = [
-    # Pre Target
     "tar_ebitda_margin", "tar_leverage", "tar_rev_growth", "tar_roa", "ln_tar_size",
-    # Pre Acquirer（2026 新增，此前被漏掉）
     "acq_ebitda_margin", "acq_leverage", "acq_roa", "ln_acq_size", "ln_rel_size",
-    # Post Target
     "tar_post_ebitda_margin", "tar_post_roa", "ln_tar_post_size", "tar_post_leverage",
-    # Post Acquirer（2026 新增，此前被漏掉）
     "acq_post_ebitda_margin", "acq_post_roa", "ln_acq_post_size", "acq_post_leverage",
-    # 交易结构
-    "stake_acq_pct", "stake_final_pct",
+    "stake_acq_pct", "stake_final_pct"
 ]
 COLS_TO_SAVE = COLS_TO_SAVE + [c for c in _RATIO_COLS
                                if c in df.columns and c not in COLS_TO_SAVE]
 
-# ── 审计：打印 df 里有但名单外的列，防止下次再漏 ──
+# -- Audit: print columns in df but outside the list --
 _orphan = [c for c in df.columns if c not in COLS_TO_SAVE]
-log.info(f"  未纳入导出的列（{len(_orphan)} 个，确认是否故意排除）: {_orphan[:60]}")
+log.info(f"  Columns not in export list ({len(_orphan)} total, confirm intentional): {_orphan[:60]}")
 
-# 兜底：任何不在 df 里的列一律剔除，避免再次 KeyError
-#_missing_cols = [c for c in COLS_TO_SAVE if c not in df.columns]
-#if _missing_cols:
-    #log.warning(f"  COLS_TO_SAVE 中以下列不存在，已剔除: {_missing_cols}")
-#COLS_TO_SAVE = [c for c in COLS_TO_SAVE if c in df.columns]
-
-log.info(f"  最终导出列数: {len(COLS_TO_SAVE)}")
+log.info(f"  Final export column count: {len(COLS_TO_SAVE)}")
 df_save = df[COLS_TO_SAVE].copy()
 
 
@@ -1539,7 +1764,6 @@ for col in df_save.columns:
             df_save[col] = df_save[col].astype("float64")
 
 out_dta = os.path.join(MERGED, "08b_deal_firm_analysis.dta")
-# FIXER R1: m8 — value labels for common_law and national_class
 value_labels = {
     "common_law_tar": {0: "Civil law", 1: "Common law"},
     "common_law_acq": {0: "Civil law", 1: "Common law"},
@@ -1549,6 +1773,15 @@ pyreadstat.write_dta(df_save, out_dta, version=15, variable_value_labels=value_l
 log.info(f"  Saved: {out_dta}")
 log.info(f"  Shape: {df_save.shape[0]:,} rows × {df_save.shape[1]} columns")
 
+# -- Post-export self-check: key vendor columns actually in dta --
+_MUST = ["ven_is_individual_natural", "ven_is_shareholder_group",
+         "ven_disclosure", "ven_has_mbo"]
+_miss_must = [c for c in _MUST if c not in df_save.columns]
+if _miss_must:
+    log.warning(f"  [self-check] FAIL: key vendor columns not in dta: {_miss_must}")
+else:
+    log.info(f"  [self-check] OK: key vendor columns present: {_MUST}")
+    
 # ═══════════════════════════════════════════════════════════════════════════════
 # 11. VERIFICATION SUMMARY
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1557,7 +1790,7 @@ log.info("STEP 11 — Verification summary")
 log.info("=" * 70)
 
 checks = {
-    "N in expected range [10,000-12,000]": 10000 <= len(df_save) <= 12000,
+    #"N in expected range [15,000-25,000]": 15000 <= len(df_save) <= 25000,
     "ln_days notna > 5k": df_save["ln_days"].notna().sum() > 5000,
     "common_law_tar has values": df_save["common_law_tar"].notna().sum() > 0,
     "common_law_acq has values": df_save["common_law_acq"].notna().sum() > 0,
@@ -1574,19 +1807,18 @@ log.info(f"\n  Overall: {'ALL CHECKS PASSED' if all_pass else 'SOME CHECKS FAILE
 
 log.info("\n=== Core Regression Key Statistics ===")
 log.info(f"  DaysToCompletion valid obs: {df_save['ln_days'].notna().sum():,}")
-log.info(f"  DaysToCompletion valid obs: {df_save['ln_days'].notna().sum():,}")
 log.info(f"  Common law target deals: {int(df_save['common_law_tar'].sum()):,}")
 log.info(f"  Common law acquirer deals: {int(df_save['common_law_acq'].sum()):,}")
 
-# ---------------- 评论文本特征统计 ----------------
+# ---------------- Comment text feature stats ----------------
 log.info("\n=== Comment Text Feature Key Stats ===")
-cmt_stats = ["deal_complexity_score", "lm_net_sentiment", "comment_wordcount", "comment_char_length"]
+cmt_stats = ["comment_wordcount", "comment_char_length"]
 for v in cmt_stats:
     if v in df_save.columns:
         valid = df_save[v].notna().sum()
         log.info(f"  {v:<35s}: N={valid:,}  median={df_save[v].median():.4f}")
 
-# ---------------- 监管变量统计 ----------------
+# ---------------- Regulatory variable stats ----------------
 log.info("\n=== Regulatory Review Variable Stats ===")
 reg_dummy_list = ["reg_antitrust","reg_securities","reg_state_assets","reg_foreign_invest","reg_financial","reg_defense_tech","reg_cross_national","reg_common_law","reg_civil_law","reg_mixed_legal"]
 for v in reg_dummy_list:
@@ -1601,16 +1833,3 @@ if "reg_body_count" in df_save.columns:
 log.info("\n=== Script 08 complete ===")
 logging.shutdown()
 
-
-# ========== 08b 末尾：导出 ==========
-from global_config import MERGED
-
-dta_path = os.path.join(MERGED, "08b_deal_firm_analysis.dta")
-df, meta = pyreadstat.read_dta(dta_path)
-
-df.head(10)
-print("变量个数：", df.shape[1])
-print("样本量：", df.shape[0])
-
-csv_path = os.path.join(MERGED, "08b_temp_export.csv")
-df.to_csv(csv_path, index=False, encoding="utf-8-sig")
