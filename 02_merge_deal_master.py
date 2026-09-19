@@ -17,7 +17,7 @@ Input Cleaned Modules (data/cleaned/):
 ──────────────────────────────────────────────────────────────────────────────
 ⚠️ TWO DISTINCT REGULATORY MEASURES — DO NOT CONFUSE (2026-09-06)
 ──────────────────────────────────────────────────────────────────────────────
-  (A) STRUCTURED — reg_* from Module E (01b_deal_overview.csv)  ← PRIMARY
+  (A) STRUCTURED — reg_* from MODULE 01b.reg (01b_deal_overview.csv)  ← PRIMARY
       reg_antitrust, reg_securities, reg_state_assets, reg_foreign_invest,
       reg_financial, reg_defense_tech, reg_body_count, reg_country_count,
       reg_cross_national, reg_common_law, reg_civil_law, reg_mixed_legal,
@@ -34,7 +34,7 @@ Input Cleaned Modules (data/cleaned/):
       reg_* dummies are deal-level ORs across ALL bodies on that deal and are
       NOT mutually exclusive (a combined supervisor sets several).
 
-  (B) TEXT-DERIVED — from Module F (01c_comments_features.csv)  ← SECONDARY
+  (B) TEXT-DERIVED — from (01c_comments_features.csv)  ← SECONDARY
       reg_event_count, num_unique_reg
 
       Counted from comment TEXT via keyword scanning. Coverage is low and
@@ -44,16 +44,6 @@ Input Cleaned Modules (data/cleaned/):
   measure only. Any docstring or table note claiming reg_* comes from
   comments is WRONG — see 08b docstring, corrected 2026-09-06.
 
-──────────────────────────────────────────────────────────────────────────────
-Merge key asymmetry (important):
-  - Modules B, C, D, F are deal-level: merged on `deal_num` only.
-  - Module E (01b) is (deal_num × target) level: it RETAINS multi-target
-    deals (unlike Module 03, which drops them), so its row count (58,963)
-    exceeds its unique deal count (55,586) by 3,377 rows. It is therefore
-    merged on the composite key (deal_num, _tar_key), where
-        _tar_key = tar_bvd_id_num.fillna(tar_name)
-    Do NOT "simplify" this to deal_num-only — it would reintroduce row
-    duplication.
 
 Output Files:
     data/merged/02_deal_master.csv        Full integrated master panel
@@ -64,14 +54,32 @@ Processing Notes:
   - Duplicate identifier fields (tar_name, acq_name, deal_status, deal_value) exist across separate raw modules for cross-source validation. Duplicated columns are suffixed with _ovw/_mul/_sd/_val and compared in diagnostic logs to quantify data inconsistency rates.
   - 01c_comments_features only retains numerically derived sentiment & timeline features; raw unstructured long text columns are discarded before merging to control output file size.
   - All left joins use the base industry table as anchor; transactions without matching target SIC records are permanently dropped.
-  - Country codes carried in from Module E are RAW and UNSCREENED. They are
+  - Country codes carried in from MODULE 01b.overview_country are RAW and UNSCREENED. They are
     not the analysis-sample composition (China is heavily over-represented
-    before sample restrictions). Do not quote Module E's country
+    before sample restrictions). Do not quote MODULE 01b.overview_country's country
     distribution as the sample composition — see table1 Panel E instead.
+
+──────────────────────────────────────────────────────────────────────────────
+REVISED 2026-09-18 (vendor identity columns)
+──────────────────────────────────────────────────────────────────────────────
+  [1] ★ STEP 5c 的筛列前缀新增 "ven_has_", 并单独纳入 ven_disclosure
+      旧版只认 ven_type / ven_ner / ven_n_names / ven_is_ 四个前缀,
+      导致 01d v4 新增的两列被静默丢弃:
+        ven_has_mbo      (MBO / 管理层参与标记, overlapping, 2,175 笔)
+        ven_disclosure   (披露维度: named / generic / undisclosed / no_record)
+      这两列永远进不了 02, 也就进不了 08b 的 dta。
+  [2] 合并后新增诊断: 打印 ven_disclosure 与 ven_has_mbo 的分布,
+      便于一眼确认新列已带入。
+  [3] 原文件有两个同名 "STEP 5c" (vendor identity 与 source dummy),
+      诊断日志无法区分。后者标题改为 "STEP 5c-src"。
+
+  注: ven_is_* dummy 由 08b 补丁 B 生成 (不在 01d), 此处的 "ven_is_"
+      前缀保留仅为兼容, 当前匹配不到任何列, 无害。
 
 Author: Q Date: 2026-08-08
 Revised 2026-09-06: documented the two distinct regulatory measures and the
-    Module E composite merge key.
+    MODULE 01b.overview_country composite merge key.
+Revised 2026-09-18: vendor-identity column whitelist + new-column diagnostics.
 """
 
 import os
@@ -238,6 +246,77 @@ n_country = df["tar_country_code"].notna().sum() if "tar_country_code" in df.col
 log(f"After merge: {len(df):,} rows | rows with tar_country_code: {n_country:,} "
     f"({n_country/len(df)*100:.1f}%)")
 
+# ════════════════════════════════════════════════════════════════════════════
+# 5c. Merge vendor / seller identity (01a Module G) —— deal-level, left join
+#     粒度说明: 01_deal_vendor_type.csv 是 deal 级; 基表是 deal × target 级。
+#     多目标交易会把同一 vendor 属性广播到该 deal 的每个 target 行 —— 符合预期。
+#     03_clean_firm_modules 里的 "DROP all ven_*" 只作用于 firm 模块内部,
+#     与本步骤注入的 deal 级 vendor 列无关, 不受影响。
+#
+#     ⚠️ 2026-09-18 修订: 白名单新增 "ven_has_" 前缀与 ven_disclosure。
+#        01d v4 新增 ven_has_mbo / ven_disclosure 两列, 旧白名单只认四个前缀
+#        (ven_type / ven_ner / ven_n_names / ven_is_), 这两列会被静默丢弃。
+# ════════════════════════════════════════════════════════════════════════════
+log("\n" + "=" * 60)
+log("STEP 5c — Merge 01_deal_vendor_type.csv (seller identity, 01a Module G)")
+log("=" * 60)
+
+_VENDOR_FP = os.path.join(CLEANED, "01_deal_vendor_type.csv")
+if os.path.exists(_VENDOR_FP):
+    _dfv = pd.read_csv(_VENDOR_FP, encoding="utf-8-sig", low_memory=False)
+    _dfv["deal_num"] = pd.to_numeric(_dfv["deal_num"], errors="coerce").astype("Int64")
+    _dfv = _dfv.drop_duplicates(subset=["deal_num"], keep="first")
+    log(f"Vendor rows: {len(_dfv):,} | unique deals: {_dfv['deal_num'].nunique():,}")
+
+    # ── 白名单: 只带入分类相关列 (不引入 ven_name_all 等长文本, 控制文件体积) ──
+    #    v4 修订: 新增 "ven_has_" 前缀 + 显式纳入 ven_disclosure
+    _vcols = ["deal_num"] + [
+        c for c in _dfv.columns
+        if c.startswith(("ven_type", "ven_ner", "ven_n_names",
+                         "ven_is_", "ven_has_"))
+        or c == "ven_disclosure"
+    ]
+    _vcols = [c for c in _vcols if c in _dfv.columns]
+    log(f"  带入列 ({len(_vcols)}): {_vcols}")
+
+    # 防冲突: 基表若已有同名列, 先丢弃再用 01a 最新版
+    _dup = [c for c in _vcols if c != "deal_num" and c in df.columns]
+    if _dup:
+        log(f"  [warn] 基表已存在同名列, 将被覆盖: {_dup}")
+        df = df.drop(columns=_dup)
+
+    _before = len(df)
+    df = df.merge(_dfv[_vcols], on="deal_num", how="left")
+    if len(df) != _before:
+        raise AssertionError(
+            f"vendor merge 改变了行数: {_before:,} -> {len(df):,} (应为 deal 级左连接, 不增行)"
+        )
+
+    if "ven_type_primary" in df.columns:
+        _n = df["ven_type_primary"].notna().sum()
+        log(f"\n  ven_type_primary 非空: {_n:,} / {len(df):,} ({_n/len(df)*100:.1f}%)")
+        log("  分布:")
+        for _k, _c in df["ven_type_primary"].value_counts().head(12).items():
+            log(f"    {str(_k):<30s} {_c:>7,}")
+    else:
+        log("  [warn] ven_type_primary 未出现在合并结果中, 检查 01a Module G 是否已运行")
+
+    # ── v4 新增诊断: 确认新列已带入 ──
+    if "ven_disclosure" in df.columns:
+        log("\n  ven_disclosure 分布:")
+        for _k, _c in df["ven_disclosure"].value_counts(dropna=False).items():
+            log(f"    {str(_k):<30s} {_c:>7,}")
+    else:
+        log("  [warn] ven_disclosure 未带入 —— 检查 01d 是否已重跑")
+
+    if "ven_has_mbo" in df.columns:
+        _m = pd.to_numeric(df["ven_has_mbo"], errors="coerce")
+        log(f"\n  ven_has_mbo = 1: {int(_m.fillna(0).sum()):,} "
+            f"({_m.fillna(0).mean()*100:.1f}%)")
+    else:
+        log("  [warn] ven_has_mbo 未带入 —— 检查 01d 是否已重跑")
+else:
+    log(f"  [skip] 未找到 {_VENDOR_FP} —— 请先运行 01a (Module G)")
 
 # ════════════════════════════════════════════════════════════════════════════
 # 5b. Duplicate variable QC check
@@ -310,10 +389,12 @@ if "tar_name" in df.columns and "tar_name_ovw" in df.columns:
                     .to_string(index=False))
 
 # ════════════════════════════════════════════════════════════════════════════
-# 5c. Merge deal‑level source source count dummy (Module E info‑source)
+# 5c-src. Merge deal‑level source count dummy (Module E info‑source)
+#   (原文件名里也叫 STEP 5c, 与上面的 vendor identity 重名;
+#    2026-09-18 改标题为 5c-src, 避免诊断日志混淆)
 # ════════════════════════════════════════════════════════════════════════════
 log("\n" + "=" * 60)
-log("STEP 5c — Merge deal source count dummy (01_deal_source_dummy)")
+log("STEP 5c-src — Merge deal source count dummy (01_deal_source_dummy)")
 log("=" * 60)
 
 df_src_dummy = pd.read_csv(os.path.join(CLEANED, "01_deal_info_source_count.csv"),
@@ -345,7 +426,7 @@ for col in src_dummy_cols:
     non_zero = (df[col] > 0).sum()
     pct_nonzero = non_zero / len(df) *100
     log(f"  {col:<35s}: {non_zero:>7,} non‑zero ({pct_nonzero:5.1f}%)")
-    
+
 # ════════════════════════════════════════════════════════════════════════════
 # 5d. Merge deal comments text features (Module F)
 # One-to-one match on deal_num, drop raw long text columns to shrink file size
